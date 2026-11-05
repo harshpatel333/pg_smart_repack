@@ -40,9 +40,10 @@ sed -i "/recovery_min_apply_delay/d" "$REPLICA_DATA/postgresql.auto.conf"
 wait $pid; rc=$?
 check backoff-replica-lag "$log" $rc
 
-# 2. WAL size: threshold just above the current size; then shrink pg_wal.
+# 2. WAL size: pg_wal sits at its recycled steady state, so set the threshold
+#    below the current size (pauses at once), then shrink pg_wal to clear it.
 log=$OUT/backoff-wal.log
-cur=$(psql -XAtc "select round(sum(size) / 1024.0^3 + 0.25, 2) from pg_ls_waldir()")
+cur=$(psql -XAtc "select greatest(0.1, round(sum(size) / 1024.0^3 - 0.5, 2)) from pg_ls_waldir()")
 "$PG_REPACK" "${base[@]}" --backoff-replica-lag=0 --backoff-wal-gb="$cur" > "$log" 2>&1 &
 pid=$!
 wait_for "$log" "signal=wal-gb" 120 || echo "    (no wal-gb back-off seen; threshold $cur GB)"
@@ -52,17 +53,19 @@ wait $pid; rc=$?
 psql -XAtc "alter system reset max_wal_size" -c "select pg_reload_conf()" >/dev/null
 check backoff-wal-gb "$log" $rc
 
-# 3. IO waiters: cold-cache TOAST reads from 16 clients.
+# 3. IO waiters: random point lookups that detoast cold values, from 32
+#    clients, against a larger table ($IO_DB, loaded with setup.sql rows=N).
 log=$OUT/backoff-io.log
 cat > "$OUT/ioload.sql" <<'EOF'
-SELECT sum(length(payload::text)) FROM t1test.agent_execution_steps TABLESAMPLE SYSTEM (20);
+\set k random(0, 99999)
+SELECT length(payload->>'blob') FROM t1test.agent_execution_steps WHERE id = 's-' || (1 + 2 * :k);
 EOF
 "$PG_REPACK" "${base[@]}" --backoff-replica-lag=0 --backoff-wal-gb=0 --backoff-io-waiters=3 > "$log" 2>&1 &
 pid=$!
 wait_for "$log" "phase=copy pages=" 60
 for i in 1 2 3; do
   sudo sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches'
-  timeout 8 pgbench -n -f "$OUT/ioload.sql" -c 16 -T 8 >/dev/null 2>&1
+  PGDATABASE=${IO_DB:-pacing} timeout 10 pgbench -n -f "$OUT/ioload.sql" -c 32 -j 4 -T 10 >/dev/null 2>&1
   grep -q "signal=io-waiters" "$log" && break
 done
 wait $pid; rc=$?

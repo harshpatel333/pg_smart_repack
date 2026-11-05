@@ -43,25 +43,53 @@ a bare number means seconds.
 | `REPACK_DUTY_CYCLE` | `--duty-cycle` | 0.33 | 1 | After a slice that took *t*, sleep *t × (1/X − 1)*. |
 | `REPACK_MAX_SLICE_SLEEP` | `--max-slice-sleep` | 30s | 0 = no cap | Upper bound on one pacing sleep. |
 | `REPACK_BACKOFF_IO_WAITERS` | `--backoff-io-waiters` | 16 | 0 | Pause while ≥ N *other* client backends are active with `wait_event_type = 'IO'`. |
-| `REPACK_BACKOFF_WAL_GB` | `--backoff-wal-gb` | 35 | 0 | Pause while `sum(size) FROM pg_ls_waldir()` ≥ G GB. |
+| `REPACK_BACKOFF_WAL_GB` | `--backoff-wal-gb` | 35 | 0 | Pause while `sum(size) FROM pg_ls_waldir()` ≥ G GB. **Read the WAL note below before relying on it.** |
 | `REPACK_BACKOFF_REPLICA_LAG` | `--backoff-replica-lag` | 60s | 0 | Pause while `max(replay_lag)` in `pg_stat_replication` ≥ S. |
 | `REPACK_BACKOFF_STEP` | `--backoff-step` | 10s | — | Re-check interval while paused. |
 | `REPACK_BACKOFF_MAX` | `--backoff-max` | 600s | 0 | If one pause lasts longer, log a WARNING every step. The run keeps waiting; it never aborts for this. |
-| `REPACK_MAX_RUNTIME` | `--max-runtime` | 4h | 0 | Abort and clean up after this long. This bounds how long the copy snapshot holds back vacuum database-wide. |
+| `REPACK_MAX_RUNTIME` | `--max-runtime` | 4h | 0 | Abort and clean up after this long. This bounds how long the copy snapshot holds back vacuum database-wide. The default applies in throttled mode only; elsewhere it is off unless given. |
 | `REPACK_PROGRESS_INTERVAL` | `--progress-interval` | 60s | 0 | Seconds between progress lines. |
 | `REPACK_APPLY_COUNT` | `--apply-count` | 1000 | — | Log rows per replay batch (a stock flag). |
 
-Back-off is checked before every copy slice and every replay batch. Pacing
-applies after each slice and after each replay batch, **except** the final
-`apply_log` under the exclusive lock right before the swap, which must stay
-short. Index builds are neither paced nor backed off, because each
-`CREATE INDEX` is a single statement.
+**When back-off and pacing apply:**
+
+- **Before setup.** Back-off is checked once before the trigger is installed.
+  No snapshot is held yet, so a pause there costs nothing.
+- **During the copy and replay.** Back-off is checked before every copy slice
+  and every replay batch.
+- **Pacing after each step.** Pacing applies after each slice, and after each
+  replay batch **only until the log backlog first grows**. Pacing helps only
+  with the backlog that piled up during the copy; in steady state replay
+  writes no more than the app itself. Once the app writes faster than paced
+  replay drains `repack.log_<oid>`, replay runs at full speed for the rest of
+  the phase, and the client logs the switch. Without that, replay might
+  never converge before `--max-runtime`.
+- **The final `apply_log` is never paced.** It runs under the exclusive lock
+  right before the swap and must stay short.
+- **Index builds are neither paced nor backed off,** because each
+  `CREATE INDEX` is a single statement.
+
+**WAL note (prod, checked 11/5):** `max_wal_size` is 40 GB plus a 0.4 GB
+`wal_keep_size`. Checkpoints can keep `pg_wal` near that size even at rest,
+so the 35 GB default can fire during a run and stay on for a long time. Every
+pause holds the copy snapshot, until `--max-runtime` at the latest. The client
+prints `pg_wal` against `max_wal_size` at start and warns when the threshold
+is at or below it. **For prod, either set `REPACK_BACKOFF_WAL_GB` above ~41,
+or accept long pauses.** The 11/4 run reached 43 GB.
+
+If the monitoring connection fails mid-run, the client logs a WARNING that
+back-off signals cannot fire. It then reconnects every 10 s and logs again
+when it recovers. Pacing continues regardless.
 
 The throttle only works in `--no-order` mode, which `repack.sh` always uses.
 Passing a copy or back-off flag together with ordering (`-o`, or the default
 CLUSTER order) is an error. In ordered mode the client behaves like stock
 1.5.3 and prints nothing new, except that `--max-runtime` and SIGTERM handling
 still apply.
+
+**Prod settings that matter, checked 11/5:** `idle_in_transaction_session_timeout`
+and `statement_timeout` are both 0. That matters because the copy transaction
+sits idle during pacing sleeps; a non-zero idle timeout would kill it.
 
 **Azure privileges, checked on prod 11/5:** `postgres` is not a superuser, but
 it inherits `pg_monitor` and `pg_read_all_stats` through `azure_pg_admin`. So
@@ -100,7 +128,8 @@ In a progress line:
 Stop the job execution. Container Apps sends SIGTERM. `repack.sh` forwards it
 to `pg_repack`, which then:
 
-1. cancels its running statement (`PQcancel`);
+1. cancels its running statement (`PQcancel`). This includes a still-queued
+   lock request: the stock client ignored signals there;
 2. rolls back the copy transaction, which removes the new table's files;
 3. reconnects, takes the table lock briefly, and calls `repack.repack_drop()`
    to remove the trigger, log table and types;
@@ -114,8 +143,14 @@ pg_repack aborted cleanly: reason=SIGTERM table=t….agent_execution_steps phase
 the swap committed, the line says `pg_repack interrupted after swap`. In that
 case the table *was* repacked and only the temporary objects were dropped.
 
-If cleanup itself fails, for example because it could not get the table lock
-within `--wait-timeout`, the last line is
+**Cleanup is bounded so that it fits the stop grace period.** The abort path
+waits at most 10 s for the table lock. Then it cancels the backends holding
+conflicting locks, and terminates them after 20 s. It does this **even with
+`--no-kill-backend`**. A slow lock here would otherwise end in SIGKILL, which
+leaves the trigger logging every write. In practice, only an app transaction
+that has held a lock on the table for over 10 s gets cancelled.
+
+If cleanup fails anyway, the last line is
 `pg_repack abort cleanup FAILED … run abort-repack.sql`.
 
 **SIGKILL still leaves leftovers.** SIGKILL is what happens if the grace
@@ -127,12 +162,15 @@ the way the stock client's single statement did on 11/4.
 
 **Grace period:** `terminationGracePeriodSeconds` is not part of the Container
 Apps *job* template in any API version we checked (2024-03-01 to 2025-07-01).
-It exists only for container apps. The job therefore gets the platform
-default. In local tests, clean-up took well under a second after SIGTERM.
-On prod it is dominated by the brief exclusive lock that `repack_drop` needs,
-and `--no-kill-backend` waits up to `--wait-timeout` (120 s) for it. If a
-stop is ever SIGKILLed before the "aborted cleanly" line appears, use
-`abort-repack.sql`.
+It exists only for container apps. So the job gets the platform default
+(30 s), and `job-update.sh` does not try to set it. In local tests, cleanup
+finished within a second of SIGTERM. Under lock contention it is bounded at
+about 20 s, as described above. If a stop is ever SIGKILLed before the
+"aborted cleanly" line appears, run `abort-repack.sql` promptly.
+
+**Known limit:** with `--jobs` > 1, the parallel index-build workers do not
+react to a signal until their `CREATE INDEX` finishes. This is stock
+behaviour. `repack.sh` does not use `--jobs`.
 
 ## Planning a prod run (lessons from 11/4)
 

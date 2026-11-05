@@ -29,17 +29,22 @@ set -eu
 die() { echo "repack.sh: $*" >&2; exit 2; }
 
 : "${REPACK_TABLE:?REPACK_TABLE is required}"
+# Character whitelist first (rules out newlines, spaces, quotes), then the
+# exact shape. grep is line-based, so the whitelist must come first.
 case "$REPACK_TABLE" in
-  t[a-z0-9]*.agent_execution_steps) ;;
-  *) die "refusing table '$REPACK_TABLE': only t*.agent_execution_steps is allowed" ;;
+  *[!a-z0-9_.]*) die "refusing table: only [a-z0-9_.] characters are allowed" ;;
 esac
-# The schema part must be a plain tenant id (no quoting tricks, no dots).
-echo "$REPACK_TABLE" | grep -Eq '^t[a-z0-9]+\.agent_execution_steps$' \
-  || die "refusing table '$REPACK_TABLE': unexpected characters"
+printf '%s\n' "$REPACK_TABLE" | grep -Eqx 't[a-z0-9]+\.agent_execution_steps' \
+  || die "refusing table '$REPACK_TABLE': only t<tenant>.agent_execution_steps is allowed"
 : "${DATABASE_URL_DIRECT:?DATABASE_URL_DIRECT is required}"
 db=${DATABASE_URL_DIRECT##*/}   # path after the last '/'
 db=${db%%\?*}                   # drop ?sslmode=... etc.
 [ "$db" = "edgedive" ] || die "refusing database '$db': only edgedive is allowed"
+# A query string can override the database (?dbname=...), so also ask the
+# server which database this URL really reaches.
+real_db=$(psql "$DATABASE_URL_DIRECT" -XAtc "SELECT current_database()") \
+  || die "cannot connect with DATABASE_URL_DIRECT"
+[ "$real_db" = "edgedive" ] || die "refusing: DATABASE_URL_DIRECT connects to '$real_db', not edgedive"
 
 set -- --dbname="$DATABASE_URL_DIRECT" --no-superuser-check --no-order --no-kill-backend --wait-timeout=120 \
        --table="$REPACK_TABLE"
@@ -49,31 +54,35 @@ set -- --dbname="$DATABASE_URL_DIRECT" --no-superuser-check --no-order --no-kill
 add() { # add ENV_NAME --flag REGEX
   eval "val=\${$1:-}"
   [ -z "$val" ] && return 0
-  echo "$val" | grep -Eq "$3" || die "$1='$val' is not valid for $2"
+  case "$val" in
+    *[!0-9a-z.]*) die "$1 is not valid for $2: only [0-9a-z.] characters are allowed" ;;
+  esac
+  printf '%s\n' "$val" | grep -Eqx "$3" || die "$1='$val' is not valid for $2"
   set_args="$set_args $2=$val"
 }
-num='^[0-9]+([.][0-9]+)?$'
-dur='^[0-9]+([.][0-9]+)?(ms|s|m|min|h|d)?$'
+num='[0-9]+([.][0-9]+)?'
+dur='[0-9]+([.][0-9]+)?(ms|s|m|min|h|d)?'
 set_args=""
-add REPACK_COPY_SLICE_PAGES    --copy-slice-pages    '^[0-9]+$'
+add REPACK_COPY_SLICE_PAGES    --copy-slice-pages    '[0-9]+'
 add REPACK_DUTY_CYCLE          --duty-cycle          "$num"
 add REPACK_MAX_SLICE_SLEEP     --max-slice-sleep     "$dur"
-add REPACK_BACKOFF_IO_WAITERS  --backoff-io-waiters  '^[0-9]+$'
+add REPACK_BACKOFF_IO_WAITERS  --backoff-io-waiters  '[0-9]+'
 add REPACK_BACKOFF_WAL_GB      --backoff-wal-gb      "$num"
 add REPACK_BACKOFF_REPLICA_LAG --backoff-replica-lag "$dur"
 add REPACK_BACKOFF_STEP        --backoff-step        "$dur"
 add REPACK_BACKOFF_MAX         --backoff-max         "$dur"
 add REPACK_MAX_RUNTIME         --max-runtime         "$dur"
 add REPACK_PROGRESS_INTERVAL   --progress-interval   "$dur"
-add REPACK_APPLY_COUNT         --apply-count         '^[0-9]+$'
-# shellcheck disable=SC2086  # values were validated above: no spaces or globs
+add REPACK_APPLY_COUNT         --apply-count         '[0-9]+'
+# shellcheck disable=SC2086  # values were whitelisted above: no whitespace or globs
 set -- "$@" $set_args
 case "${REPACK_DRY_RUN:-}" in
   1|true|yes) set -- "$@" --dry-run ;;
 esac
 
-size() {
-  psql "$DATABASE_URL_DIRECT" -XAtc "SELECT pg_size_pretty(pg_total_relation_size('$REPACK_TABLE'))" 2>/dev/null || echo "?"
+size() {  # table name passed as a psql variable, never spliced into SQL
+  echo "SELECT pg_size_pretty(pg_total_relation_size(:'tbl'))" \
+    | psql "$DATABASE_URL_DIRECT" -XAt -v tbl="$REPACK_TABLE" 2>/dev/null || echo "?"
 }
 
 echo "repack.sh: $(pg_repack --version)"

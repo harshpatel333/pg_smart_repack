@@ -226,6 +226,8 @@ static bool repack_table_indexes(PGresult *index_details);
 static bool repack_all_indexes(char *errbuf, size_t errsize);
 static void repack_cleanup(bool fatal, const repack_table *table);
 static void repack_cleanup_callback(bool fatal, void *userdata);
+static void repack_cleanup_reporter(bool fatal, void *userdata);
+static void wait_async_interruptible(PGconn *conn);
 static void repack_cleanup_index(bool fatal, void *userdata);
 static bool rebuild_indexes(const repack_table *table);
 
@@ -268,6 +270,12 @@ static bool 			error_on_invalid_index = false; /* don't repack when invalid inde
 								 * deprecated, this the default behavior now */
 static int				apply_count = APPLY_COUNT_DEFAULT;
 static int				switch_threshold = SWITCH_THRESHOLD_DEFAULT;
+
+/* Abort cleanup: max seconds to wait for the table lock before cancelling
+ * conflicting backends (terminating them after twice this). */
+#define ABORT_LOCK_WAIT		10
+static bool				cleanup_started = false;
+static bool				cleanup_done = false;
 
 /* buffer should have at least 11 bytes */
 static char *
@@ -323,6 +331,18 @@ static const char *throttle_only_options[] =
 	NULL
 };
 
+/* Was option --lname given explicitly? */
+static bool
+option_given(const char *lname)
+{
+	int		i;
+
+	for (i = 0; options[i].type; i++)
+		if (strcmp(options[i].lname, lname) == 0)
+			return options[i].source != SOURCE_DEFAULT;
+	return false;
+}
+
 /* Name of the first throttle-only option given explicitly, or NULL. */
 static const char *
 throttle_option_given(void)
@@ -371,10 +391,17 @@ main(int argc, char *argv[])
 		if (given && (r_index.head || only_indexes))
 			ereport(ERROR, (errcode(EINVAL),
 				errmsg("option --%s cannot be used when repacking indexes only", given)));
-		if (given && (!noorder || orderby))
+		if (given && !noorder)
 			ereport(ERROR, (errcode(EINVAL),
 				errmsg("option --%s requires --no-order (the throttled copy cannot use ORDER BY or CLUSTER order)", given)));
-		thr_enabled = noorder && !orderby && !r_index.head && !only_indexes;
+		/* As in stock pg_repack, --no-order wins over --order-by. */
+		if (noorder && orderby)
+			ereport(WARNING, (errcode(EINVAL),
+				errmsg("option --order-by is ignored with --no-order")));
+		thr_enabled = noorder && !r_index.head && !only_indexes;
+		/* Outside throttled mode behave like stock unless asked for. */
+		if (!thr_enabled && !option_given("max-runtime"))
+			thr_max_runtime = 0;
 	}
 
 	check_tablespace();
@@ -1285,6 +1312,41 @@ cleanup:
  * Re-organize one table.
  */
 /*
+ * Wait for an async query on conn to finish, staying responsive to signals:
+ * on interrupt, cancel the query and raise the usual interrupt error.
+ */
+static void
+wait_async_interruptible(PGconn *conn)
+{
+	for (;;)
+	{
+		int				sock = PQsocket(conn);
+		fd_set			fds;
+		struct timeval	tv;
+
+		if (interrupted)
+		{
+			PGcancel   *c = PQgetCancel(conn);
+			char		errbuf[256];
+
+			if (c)
+			{
+				PQcancel(c, errbuf, sizeof(errbuf));
+				PQfreeCancel(c);
+			}
+			CHECK_FOR_INTERRUPTS();
+		}
+		if (!PQconsumeInput(conn) || !PQisBusy(conn) || sock < 0)
+			return;		/* done, or an error PQgetResult() will report */
+		FD_ZERO(&fds);
+		FD_SET(sock, &fds);
+		tv.tv_sec = 0;
+		tv.tv_usec = 200000;
+		(void) select(sock + 1, &fds, NULL, NULL, &tv);	/* EINTR: loop */
+	}
+}
+
+/*
  * Copy the table in slices of thr_copy_slice_pages heap pages, inside the
  * caller's SERIALIZABLE copy transaction (one snapshot for all slices).
  *
@@ -1404,7 +1466,17 @@ repack_one_table(repack_table *table, const char *orderby)
 	if (dryrun)
 		return;
 
-	/* push repack_cleanup_callback() on stack to clean temporary objects */
+	/*
+	 * Wait out any back-off before touching the table: no trigger, lock or
+	 * snapshot exists yet, so waiting here costs nothing.
+	 */
+	thr_wait_backoff();
+
+	/* push repack_cleanup_callback() on stack to clean temporary objects.
+	 * The reporter is pushed first so that it runs after the callback (and
+	 * also when the callback fails with an error). */
+	cleanup_started = cleanup_done = false;
+	pgut_atexit_push(repack_cleanup_reporter, table);
 	pgut_atexit_push(repack_cleanup_callback, table);
 
 	/*
@@ -1581,6 +1653,10 @@ repack_one_table(repack_table *table, const char *orderby)
 	 */
 	table_init = true;
 
+	/* Wait for the lock without blocking signals (stock blocked in
+	 * PQgetResult(), so SIGTERM was ignored while the lock was queued). */
+	wait_async_interruptible(conn2);
+
 	/* Keep looping PQgetResult() calls until it returns NULL, indicating the
 	 * command is done and we have obtained our lock.
 	 */
@@ -1705,7 +1781,7 @@ repack_one_table(repack_table *table, const char *orderby)
 		num = apply_log(connection, table, apply_count);
 		thr_apply_done_rows(num);
 		if (num > switch_threshold)
-			thr_pace(thr_now() - t0);
+			thr_pace_apply(thr_now() - t0);
 		else
 			thr_maybe_report(false);
 
@@ -1850,6 +1926,11 @@ cleanup:
 	 */
 	if ((!ret) && table_init)
 		repack_cleanup(false, table);
+
+	/* This table is finished or cleaned up: its callbacks must not run
+	 * again for a later table (stock 1.5.3 never popped them). */
+	pgut_atexit_pop(repack_cleanup_callback, table);
+	pgut_atexit_pop(repack_cleanup_reporter, table);
 
 	/* The guard was disarmed for the swap. Re-arm it only now that this
 	 * table is finished (or cleaned up), so an expired deadline stops the
@@ -2177,6 +2258,10 @@ repack_cleanup_callback(bool fatal, void *userdata)
 
 	if(fatal)
 	{
+		int		save_wait_timeout = wait_timeout;
+		bool	save_no_kill_backend = no_kill_backend;
+
+		cleanup_started = true;
 		params[0] = utoa(target_table, buffer);
 		params[1] = utoa(temp_obj_num, num_buff);
 
@@ -2191,20 +2276,44 @@ repack_cleanup_callback(bool fatal, void *userdata)
 		 */
 		reconnect(ERROR);
 
+		/*
+		 * Abort cleanup must finish within the stop grace period (30s on
+		 * Container Apps jobs), or SIGKILL leaves the trigger logging every
+		 * write. So wait at most ABORT_LOCK_WAIT seconds for the lock, then
+		 * cancel conflicting backends, and terminate them after twice that,
+		 * even with --no-kill-backend.
+		 */
+		wait_timeout = Min(wait_timeout, ABORT_LOCK_WAIT);
+		no_kill_backend = false;
 		command("BEGIN ISOLATION LEVEL READ COMMITTED", 0, NULL);
 		if (!(lock_exclusive(connection, params[0], table->lock_table, false)))
 		{
 			pgut_rollback(connection);
-			thr_report_abort(table->target_name, false);
 			elog(ERROR, "lock_exclusive() failed in connection for %s during cleanup callback",
 				 table->target_name);
 		}
+		wait_timeout = save_wait_timeout;
+		no_kill_backend = save_no_kill_backend;
 
 		command("SELECT repack.repack_drop($1, $2)", 2, params);
 		command("COMMIT", 0, NULL);
 		temp_obj_num = 0; /* reset temporary object counter after cleanup */
+		cleanup_done = true;
 		thr_report_abort(table->target_name, true);
 	}
+}
+
+/*
+ * Runs after repack_cleanup_callback(), including when that callback fails
+ * with an error: if cleanup started but did not finish, say so.
+ */
+static void
+repack_cleanup_reporter(bool fatal, void *userdata)
+{
+	repack_table *table = (repack_table *) userdata;
+
+	if (fatal && cleanup_started && !cleanup_done)
+		thr_report_abort(table->target_name, false);
 }
 
 /*

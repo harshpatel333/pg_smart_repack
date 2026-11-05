@@ -63,6 +63,11 @@ static double	run_deadline = 0;		/* 0 = no deadline */
 
 /* per-table state */
 static PGconn  *monconn = NULL;
+static bool		mon_active = false;	/* monitoring wanted for this table */
+static bool		mon_down = false;	/* warned that monitoring is unavailable */
+static double	mon_retry_at = 0;
+static int		mon_pid = 0;
+#define MON_RETRY_SECS	10.0
 static Oid		cur_oid = InvalidOid;
 static char	   *cur_name = NULL;
 static int		own_pids[8];
@@ -75,6 +80,11 @@ static uint64	copy_total = 0;
 static uint64	copy_done = 0;
 static double	copy_start = 0;
 static long		apply_rows = 0;
+
+/* apply pacing (thr_pace_apply) */
+static double	prev_backlog = -1;
+static bool		full_speed = false;
+static double	checked_at = 0;
 
 /* reporting */
 static double	last_report = 0;
@@ -332,12 +342,38 @@ own_pids_array(char *buf, size_t len)
 	int		i;
 	size_t	off = 0;
 
-	off += snprintf(buf + off, len - off, "{");
+	off += snprintf(buf + off, len - off, "{%d", mon_pid);
 	for (i = 0; i < n_own_pids && off < len; i++)
-		off += snprintf(buf + off, len - off, "%s%d", i ? "," : "", own_pids[i]);
+		off += snprintf(buf + off, len - off, ",%d", own_pids[i]);
 	if (off < len)
 		snprintf(buf + off, len - off, "}");
 	return buf;
+}
+
+/* Open the monitoring connection; NULL (with a message at elevel) on failure. */
+static PGconn *
+mon_connect(int elevel)
+{
+	PGconn	   *c = pgut_connect(dbname, host, port, username, password,
+								 prompt_password, elevel);
+
+	if (c)
+	{
+		pgut_command(c, "SET statement_timeout = '30s'", 0, NULL);
+		pgut_command(c, "SET lock_timeout = '5s'", 0, NULL);
+		mon_pid = PQbackendPID(c);
+	}
+	return c;
+}
+
+/* Say loudly (once per outage) that back-off is blind, then retry. */
+static void
+mon_unavailable(const char *why)
+{
+	if (!mon_down)
+		elog(WARNING, "monitoring unavailable (%s): back-off signals cannot fire"
+			 " until it recovers; retrying every %.0fs", why, MON_RETRY_SECS);
+	mon_down = true;
 }
 
 static PGresult *
@@ -345,12 +381,43 @@ mon_query(const char *sql, int nparams, const char **params)
 {
 	PGresult   *res;
 
-	if (!monconn)
+	if (!mon_active)
 		return NULL;
+	if (monconn && PQstatus(monconn) != CONNECTION_OK)
+	{
+		pgut_disconnect(monconn);
+		monconn = NULL;
+	}
+	if (!monconn)
+	{
+		if (thr_now() < mon_retry_at)
+			return NULL;
+		mon_retry_at = thr_now() + MON_RETRY_SECS;
+		monconn = mon_connect(DEBUG2);
+		if (!monconn)
+		{
+			mon_unavailable("cannot reconnect");
+			return NULL;
+		}
+		if (mon_down)
+			elog(INFO, "monitoring connection re-established; back-off signals active again");
+		mon_down = false;
+	}
 	res = pgut_execute_elevel(monconn, sql, nparams, params, DEBUG2);
 	if (PQresultStatus(res) != PGRES_TUPLES_OK)
 	{
+		char		why[160];
+
+		snprintf(why, sizeof(why), "%s", PQerrorMessage(monconn));
+		why[strcspn(why, "\n")] = '\0';
 		CLEARPGRES(res);
+		if (PQstatus(monconn) != CONNECTION_OK)
+		{
+			pgut_disconnect(monconn);
+			monconn = NULL;
+			mon_retry_at = 0;	/* reconnect on the next call */
+		}
+		mon_unavailable(why);
 		return NULL;
 	}
 	return res;
@@ -372,7 +439,7 @@ refresh_metrics(bool force)
 	const char *params[1];
 	double		now = thr_now();
 
-	if (!monconn || (!force && now - metrics_at < METRICS_MIN_AGE))
+	if (!mon_active || (!force && now - metrics_at < METRICS_MIN_AGE))
 		return;
 	metrics_at = now;
 
@@ -505,6 +572,9 @@ thr_begin_table(Oid target_oid, const char *target_name, bool dryrun)
 	n_own_pids = 0;
 	copy_total = copy_done = 0;
 	apply_rows = 0;
+	prev_backlog = -1;
+	full_speed = false;
+	checked_at = 0;
 	last_bytes = -1;
 	backoff_reason = NULL;
 	metrics_at = 0;
@@ -520,11 +590,9 @@ thr_begin_table(Oid target_oid, const char *target_name, bool dryrun)
 		return;
 
 	if (!monconn)
-		monconn = pgut_connect(dbname, host, port, username, password,
-							   prompt_password, ERROR);
-	pgut_command(monconn, "SET statement_timeout = '30s'", 0, NULL);
-	pgut_command(monconn, "SET lock_timeout = '5s'", 0, NULL);
-	thr_add_own_pid(monconn);
+		monconn = mon_connect(ERROR);
+	mon_active = true;
+	mon_down = false;
 	thr_add_own_pid(connection);
 	thr_add_own_pid(conn2);
 
@@ -549,6 +617,34 @@ thr_begin_table(Oid target_oid, const char *target_name, bool dryrun)
 			 PQresultErrorMessage(res));
 	CLEARPGRES(res);
 
+	/*
+	 * Checkpoints keep pg_wal at up to max_wal_size (plus wal_keep_size and
+	 * slot retention) even when idle, so a threshold at or below that can
+	 * hold a back-off - and the copy snapshot - until --max-runtime.
+	 */
+	if (wal_ok && thr_chatty() && thr_backoff_wal_gb > 0)
+	{
+		res = pgut_execute_elevel(monconn,
+			"SELECT (pg_size_bytes(current_setting('max_wal_size'))"
+			"      + pg_size_bytes(current_setting('wal_keep_size'))) / 1024.0^3,"
+			"       (SELECT sum(size) FROM pg_ls_waldir()) / 1024.0^3",
+			0, NULL, DEBUG2);
+		if (PQresultStatus(res) == PGRES_TUPLES_OK)
+		{
+			double	steady = getdbl(res, 0, 0, 0);
+			double	now_gb = getdbl(res, 0, 1, 0);
+
+			if (thr_backoff_wal_gb <= steady)
+				elog(WARNING, "--backoff-wal-gb=%.1f is at or below max_wal_size +"
+					 " wal_keep_size (%.1fGB): pg_wal can stay that large at steady"
+					 " state and hold the back-off until --max-runtime",
+					 thr_backoff_wal_gb, steady);
+			elog(INFO, "wal: pg_wal=%.1fGB now, max_wal_size+wal_keep_size=%.1fGB,"
+				 " back-off threshold=%.1fGB", now_gb, steady, thr_backoff_wal_gb);
+		}
+		CLEARPGRES(res);
+	}
+
 	/* Without pg_read_all_stats, other roles' wait events and replay_lag are hidden. */
 	res = pgut_execute_elevel(monconn,
 		"SELECT pg_has_role('pg_read_all_stats', 'member')"
@@ -570,6 +666,7 @@ thr_begin_table(Oid target_oid, const char *target_name, bool dryrun)
 void
 thr_end_table(void)
 {
+	mon_active = false;
 	if (monconn)
 	{
 		pgut_disconnect(monconn);
@@ -633,6 +730,23 @@ temp_table_bytes(void)
 		return -1;
 	snprintf(sql, sizeof(sql),
 			 "SELECT pg_total_relation_size(to_regclass('repack.table_%u'))", cur_oid);
+	if (PQtransactionStatus(connection) == PQTRANS_INTRANS)
+	{
+		/* Inside the copy transaction: a savepoint keeps any failure here
+		 * from aborting the copy. */
+		bool	ok;
+
+		if (pgut_command(connection, "SAVEPOINT repack_progress", 0, NULL) != PGRES_COMMAND_OK)
+			return -1;
+		res = pgut_execute_elevel(connection, sql, 0, NULL, DEBUG2);
+		ok = (PQresultStatus(res) == PGRES_TUPLES_OK);
+		if (ok)
+			v = getdbl(res, 0, 0, -1);
+		CLEARPGRES(res);
+		pgut_command(connection, ok ? "RELEASE SAVEPOINT repack_progress"
+					 : "ROLLBACK TO SAVEPOINT repack_progress", 0, NULL);
+		return v;
+	}
 	res = pgut_execute_elevel(connection, sql, 0, NULL, DEBUG2);
 	if (PQresultStatus(res) == PGRES_TUPLES_OK)
 		v = getdbl(res, 0, 0, -1);
@@ -667,7 +781,7 @@ thr_maybe_report(bool force)
 	char		b1[32], b2[32], b3[32], b4[32], b5[32];
 	StringInfoData line;
 
-	if (thr_progress_interval <= 0 || !monconn || !thr_chatty())
+	if (thr_progress_interval <= 0 || !mon_active || !thr_chatty())
 		return;
 	if (!force && last_report > 0 && now - last_report < thr_progress_interval)
 		return;
@@ -764,6 +878,43 @@ thr_pace(double busy_seconds)
 	thr_sleep(s);
 }
 
+/*
+ * Pacing for replay batches. Pacing helps only with the backlog that piled up
+ * during the copy; in steady state replay writes no more than the app does.
+ * So the first time the backlog grows between samples (the app is writing
+ * faster than paced replay drains it), pacing is switched off for the rest of
+ * the apply phase. Flipping back and forth would let the backlog hover and
+ * never converge before --max-runtime.
+ */
+void
+thr_pace_apply(double busy_seconds)
+{
+	double			now = thr_now();
+
+	if (!thr_enabled || thr_duty_cycle >= 1.0)
+	{
+		thr_maybe_report(false);
+		return;
+	}
+	if (now - checked_at >= METRICS_MIN_AGE)
+	{
+		double	backlog = log_backlog();
+
+		checked_at = now;
+		if (!full_speed && backlog >= 0 && prev_backlog >= 0 && backlog > prev_backlog)
+		{
+			elog(INFO, "apply: log backlog is growing (%.0f -> %.0f rows); replaying"
+				 " at full speed for the rest of this phase", prev_backlog, backlog);
+			full_speed = true;
+		}
+		prev_backlog = backlog;
+	}
+	if (full_speed)
+		thr_maybe_report(false);
+	else
+		thr_pace(busy_seconds);
+}
+
 static const char *
 check_backoff(double *value)
 {
@@ -795,7 +946,7 @@ thr_wait_backoff(void)
 	char		b1[32];
 
 	CHECK_FOR_INTERRUPTS();
-	if (!thr_enabled || !monconn ||
+	if (!thr_enabled || !mon_active ||
 		(thr_backoff_io_waiters <= 0 && thr_backoff_wal_gb <= 0 &&
 		 thr_backoff_replica_lag <= 0))
 	{

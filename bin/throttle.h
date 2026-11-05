@@ -74,6 +74,7 @@ extern void thr_maybe_report(bool force);
 /* Pacing and back-off. */
 extern void thr_wait_backoff(void);
 extern void thr_pace(double busy_seconds);
+extern void thr_pace_apply(double busy_seconds);
 extern void thr_sleep(double seconds);
 extern double thr_now(void);
 
