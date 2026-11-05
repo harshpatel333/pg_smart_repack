@@ -13,6 +13,7 @@ base=(--no-superuser-check --no-order --no-kill-backend --table=t1test.agent_exe
 wait_for() { # file regex timeout
   local i=0
   until grep -Eq "$2" "$1"; do sleep 0.5; i=$((i + 1)); [ $i -gt $(($3 * 2)) ] && return 1; done
+  return 0
 }
 check() { # name log
   local name=$1 log=$2 ok=PASS

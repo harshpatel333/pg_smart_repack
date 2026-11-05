@@ -1466,18 +1466,18 @@ repack_one_table(repack_table *table, const char *orderby)
 	if (dryrun)
 		return;
 
-	/*
-	 * Wait out any back-off before touching the table: no trigger, lock or
-	 * snapshot exists yet, so waiting here costs nothing.
-	 */
-	thr_wait_backoff();
-
 	/* push repack_cleanup_callback() on stack to clean temporary objects.
 	 * The reporter is pushed first so that it runs after the callback (and
 	 * also when the callback fails with an error). */
 	cleanup_started = cleanup_done = false;
 	pgut_atexit_push(repack_cleanup_reporter, table);
 	pgut_atexit_push(repack_cleanup_callback, table);
+
+	/*
+	 * Wait out any back-off before touching the table: no trigger, lock or
+	 * snapshot exists yet, so waiting here costs nothing.
+	 */
+	thr_wait_backoff();
 
 	/*
 	 * 1. Setup advisory lock and trigger on main table.
@@ -2264,6 +2264,15 @@ repack_cleanup_callback(bool fatal, void *userdata)
 		cleanup_started = true;
 		params[0] = utoa(target_table, buffer);
 		params[1] = utoa(temp_obj_num, num_buff);
+
+		/* Nothing created yet (e.g. stopped during the pre-setup back-off):
+		 * no need to lock the table just to drop nothing. */
+		if (temp_obj_num == 0)
+		{
+			cleanup_done = true;
+			thr_report_abort(table->target_name, true);
+			return;
+		}
 
 		/* Say what is happening before the (possibly slow) lock wait. */
 		elog(INFO, "aborting: reason=%s phase=%s; rolling back and dropping"

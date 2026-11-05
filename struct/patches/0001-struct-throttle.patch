@@ -12,7 +12,7 @@ index 8a56a9e..c05fbc6 100644
  PROGRAM = pg_repack
  
 diff --git a/bin/pg_repack.c b/bin/pg_repack.c
-index de67f0e..558427b 100644
+index de67f0e..ea86fdb 100644
 --- a/bin/pg_repack.c
 +++ b/bin/pg_repack.c
 @@ -22,7 +22,11 @@ const char *PROGRAM_VERSION = xstr(REPACK_VERSION);
@@ -247,7 +247,7 @@ index de67f0e..558427b 100644
  static void
  repack_one_table(repack_table *table, const char *orderby)
  {
-@@ -1280,10 +1455,28 @@ repack_one_table(repack_table *table, const char *orderby)
+@@ -1280,12 +1455,30 @@ repack_one_table(repack_table *table, const char *orderby)
  	elog(DEBUG2, "sql_update        : %s", table->sql_update);
  	elog(DEBUG2, "sql_pop           : %s", table->sql_pop);
  
@@ -263,12 +263,6 @@ index de67f0e..558427b 100644
  		return;
  
 -	/* push repack_cleanup_callback() on stack to clean temporary objects */
-+	/*
-+	 * Wait out any back-off before touching the table: no trigger, lock or
-+	 * snapshot exists yet, so waiting here costs nothing.
-+	 */
-+	thr_wait_backoff();
-+
 +	/* push repack_cleanup_callback() on stack to clean temporary objects.
 +	 * The reporter is pushed first so that it runs after the callback (and
 +	 * also when the callback fails with an error). */
@@ -276,7 +270,15 @@ index de67f0e..558427b 100644
 +	pgut_atexit_push(repack_cleanup_reporter, table);
  	pgut_atexit_push(repack_cleanup_callback, table);
  
++	/*
++	 * Wait out any back-off before touching the table: no trigger, lock or
++	 * snapshot exists yet, so waiting here costs nothing.
++	 */
++	thr_wait_backoff();
++
  	/*
+ 	 * 1. Setup advisory lock and trigger on main table.
+ 	 */
 @@ -1460,6 +1653,10 @@ repack_one_table(repack_table *table, const char *orderby)
  	 */
  	table_init = true;
@@ -400,7 +402,7 @@ index de67f0e..558427b 100644
  }
  
  /* Kill off any concurrent DDL (or any transaction attempting to take
-@@ -2025,15 +2258,33 @@ repack_cleanup_callback(bool fatal, void *userdata)
+@@ -2025,15 +2258,42 @@ repack_cleanup_callback(bool fatal, void *userdata)
  
  	if(fatal)
  	{
@@ -411,6 +413,15 @@ index de67f0e..558427b 100644
  		params[0] = utoa(target_table, buffer);
  		params[1] = utoa(temp_obj_num, num_buff);
  
++		/* Nothing created yet (e.g. stopped during the pre-setup back-off):
++		 * no need to lock the table just to drop nothing. */
++		if (temp_obj_num == 0)
++		{
++			cleanup_done = true;
++			thr_report_abort(table->target_name, true);
++			return;
++		}
++
 +		/* Say what is happening before the (possibly slow) lock wait. */
 +		elog(INFO, "aborting: reason=%s phase=%s; rolling back and dropping"
 +			 " temporary objects for %s", thr_abort_reason(), thr_get_phase(),
@@ -434,7 +445,7 @@ index de67f0e..558427b 100644
  		command("BEGIN ISOLATION LEVEL READ COMMITTED", 0, NULL);
  		if (!(lock_exclusive(connection, params[0], table->lock_table, false)))
  		{
-@@ -2041,13 +2292,30 @@ repack_cleanup_callback(bool fatal, void *userdata)
+@@ -2041,13 +2301,30 @@ repack_cleanup_callback(bool fatal, void *userdata)
  			elog(ERROR, "lock_exclusive() failed in connection for %s during cleanup callback",
  				 table->target_name);
  		}
@@ -465,7 +476,7 @@ index de67f0e..558427b 100644
  /*
   * The userdata pointing a table being re-organized. We need to cleanup temp
   * objects before the program exits.
-@@ -2458,4 +2726,15 @@ pgut_help(bool details)
+@@ -2458,4 +2735,15 @@ pgut_help(bool details)
  	printf("      --error-on-invalid-index       don't repack when invalid index is found, deprecated, as this is the default behavior now\n");
  	printf("      --apply-count                  number of tuples to apply in one transaction during replay\n");
  	printf("      --switch-threshold             switch tables when that many tuples are left to catchup\n");
@@ -578,10 +589,10 @@ index 24895c9..537665c 100644
  extern bool		pgut_echo;
 diff --git a/bin/throttle.c b/bin/throttle.c
 new file mode 100644
-index 0000000..4ba205f
+index 0000000..749d5c0
 --- /dev/null
 +++ b/bin/throttle.c
-@@ -0,0 +1,1031 @@
+@@ -0,0 +1,1036 @@
 +/*
 + * throttle.c: paced copy, automatic back-off, progress reporting and the
 + * maximum-runtime guard for pg_repack (struct-throttle build).
@@ -1196,9 +1207,14 @@ index 0000000..4ba205f
 +		"SELECT coalesce(sum(size), 0) FROM pg_ls_waldir()", 0, NULL, DEBUG2);
 +	wal_ok = (PQresultStatus(res) == PGRES_TUPLES_OK);
 +	if (!wal_ok && thr_chatty() && thr_backoff_wal_gb > 0)
++	{
++		char	why[200];
++
++		snprintf(why, sizeof(why), "%s", PQresultErrorMessage(res));
++		why[strcspn(why, "\n")] = '\0';
 +		elog(WARNING, "cannot read the WAL directory size (%s); the --backoff-wal-gb"
-+			 " signal is disabled for this run",
-+			 PQresultErrorMessage(res));
++			 " signal is disabled for this run", why);
++	}
 +	CLEARPGRES(res);
 +
 +	/*

@@ -612,9 +612,14 @@ thr_begin_table(Oid target_oid, const char *target_name, bool dryrun)
 		"SELECT coalesce(sum(size), 0) FROM pg_ls_waldir()", 0, NULL, DEBUG2);
 	wal_ok = (PQresultStatus(res) == PGRES_TUPLES_OK);
 	if (!wal_ok && thr_chatty() && thr_backoff_wal_gb > 0)
+	{
+		char	why[200];
+
+		snprintf(why, sizeof(why), "%s", PQresultErrorMessage(res));
+		why[strcspn(why, "\n")] = '\0';
 		elog(WARNING, "cannot read the WAL directory size (%s); the --backoff-wal-gb"
-			 " signal is disabled for this run",
-			 PQresultErrorMessage(res));
+			 " signal is disabled for this run", why);
+	}
 	CLEARPGRES(res);
 
 	/*
