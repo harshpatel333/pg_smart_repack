@@ -228,6 +228,7 @@ static void repack_cleanup(bool fatal, const repack_table *table);
 static void repack_cleanup_callback(bool fatal, void *userdata);
 static void repack_cleanup_reporter(bool fatal, void *userdata);
 static void wait_async_interruptible(PGconn *conn);
+static bool abort_lock_table(const repack_table *table);
 static void repack_cleanup_index(bool fatal, void *userdata);
 static bool rebuild_indexes(const repack_table *table);
 
@@ -274,8 +275,10 @@ static int				switch_threshold = SWITCH_THRESHOLD_DEFAULT;
 /* Abort cleanup: max seconds to wait for the table lock before cancelling
  * conflicting backends (terminating them after twice this). */
 #define ABORT_LOCK_WAIT		10
+#define ABORT_LOCK_GIVEUP	25
 static bool				cleanup_started = false;
 static bool				cleanup_done = false;
+static bool				setup_committed = false;	/* trigger/log may exist */
 
 /* buffer should have at least 11 bytes */
 static char *
@@ -1461,17 +1464,21 @@ repack_one_table(repack_table *table, const char *orderby)
 			errmsg("the sliced copy needs TID range scans (PostgreSQL 14 or later);"
 				   " use --copy-slice-pages=0 on this server")));
 
+	/* push repack_cleanup_callback() on stack to clean temporary objects.
+	 * The reporter is pushed first so that it runs after the callback (and
+	 * also when the callback fails with an error). Pushed before any
+	 * database work for this table, so every stop ends with a report. */
+	if (!dryrun)
+	{
+		cleanup_started = cleanup_done = setup_committed = false;
+		pgut_atexit_push(repack_cleanup_reporter, table);
+		pgut_atexit_push(repack_cleanup_callback, table);
+	}
+
 	thr_begin_table(table->target_oid, table->target_name, dryrun);
 
 	if (dryrun)
 		return;
-
-	/* push repack_cleanup_callback() on stack to clean temporary objects.
-	 * The reporter is pushed first so that it runs after the callback (and
-	 * also when the callback fails with an error). */
-	cleanup_started = cleanup_done = false;
-	pgut_atexit_push(repack_cleanup_reporter, table);
-	pgut_atexit_push(repack_cleanup_callback, table);
 
 	/*
 	 * Wait out any back-off before touching the table: no trigger, lock or
@@ -1644,7 +1651,10 @@ repack_one_table(repack_table *table, const char *orderby)
 
 	/* We're finished killing off any unsafe DDL. COMMIT in our main
 	 * connection, so that conn2 may get its ShareUpdateExclusiveLock lock.
+	 * setup_committed is set first: if a cancel races the COMMIT we would
+	 * rather run a harmless repack_drop than skip a needed one.
 	 */
+	setup_committed = true;
 	command("COMMIT", 0, NULL);
 
 	/* The main connection has now committed its repack_trigger,
@@ -2258,16 +2268,17 @@ repack_cleanup_callback(bool fatal, void *userdata)
 
 	if(fatal)
 	{
-		int		save_wait_timeout = wait_timeout;
-		bool	save_no_kill_backend = no_kill_backend;
-
 		cleanup_started = true;
 		params[0] = utoa(target_table, buffer);
 		params[1] = utoa(temp_obj_num, num_buff);
 
-		/* Nothing created yet (e.g. stopped during the pre-setup back-off):
-		 * no need to lock the table just to drop nothing. */
-		if (temp_obj_num == 0)
+		/*
+		 * Nothing committed yet (stopped before or during setup): the setup
+		 * transaction rolls back when we disconnect, so there is nothing to
+		 * drop, and no reason to lock the table or touch objects that may
+		 * belong to another pg_repack.
+		 */
+		if (!setup_committed)
 		{
 			cleanup_done = true;
 			thr_report_abort(table->target_name, true);
@@ -2285,31 +2296,108 @@ repack_cleanup_callback(bool fatal, void *userdata)
 		 */
 		reconnect(ERROR);
 
-		/*
-		 * Abort cleanup must finish within the stop grace period (30s on
-		 * Container Apps jobs), or SIGKILL leaves the trigger logging every
-		 * write. So wait at most ABORT_LOCK_WAIT seconds for the lock, then
-		 * cancel conflicting backends, and terminate them after twice that,
-		 * even with --no-kill-backend.
-		 */
-		wait_timeout = Min(wait_timeout, ABORT_LOCK_WAIT);
-		no_kill_backend = false;
 		command("BEGIN ISOLATION LEVEL READ COMMITTED", 0, NULL);
-		if (!(lock_exclusive(connection, params[0], table->lock_table, false)))
+		if (!abort_lock_table(table))
 		{
 			pgut_rollback(connection);
-			elog(ERROR, "lock_exclusive() failed in connection for %s during cleanup callback",
-				 table->target_name);
+			elog(ERROR, "could not lock %s for cleanup within %ds",
+				 table->target_name, ABORT_LOCK_GIVEUP);
 		}
-		wait_timeout = save_wait_timeout;
-		no_kill_backend = save_no_kill_backend;
-
+		/* repack_drop also drops repack.log_<oid> / table_<oid>: bound
+		 * those lock waits too, so cleanup cannot hang past the grace. */
+		command("SET LOCAL lock_timeout = '3s'", 0, NULL);
 		command("SELECT repack.repack_drop($1, $2)", 2, params);
 		command("COMMIT", 0, NULL);
+		setup_committed = false;
 		temp_obj_num = 0; /* reset temporary object counter after cleanup */
 		cleanup_done = true;
 		thr_report_abort(table->target_name, true);
 	}
+}
+
+/*
+ * Take the table lock for abort cleanup within the stop grace period (30s on
+ * Container Apps jobs; a SIGKILL there leaves the trigger logging every
+ * write). The LOCK is sent asynchronously; while it waits, conn2 looks up
+ * exactly the sessions blocking it (pg_blocking_pids) and, after
+ * ABORT_LOCK_WAIT seconds, cancels them, and after twice that terminates
+ * them. Only blockers of this lock request are touched, never other users
+ * of the table. This applies even with --no-kill-backend. Gives up after
+ * ABORT_LOCK_GIVEUP seconds.
+ */
+static bool
+abort_lock_table(const repack_table *table)
+{
+	double		start = thr_now();
+	char		pidbuf[16];
+	const char *params[1];
+	PGresult   *res;
+	bool		ok = false;
+
+	snprintf(pidbuf, sizeof(pidbuf), "%d", PQbackendPID(connection));
+	params[0] = pidbuf;
+	if (!PQsendQuery(connection, table->lock_table))
+		return false;
+
+	for (;;)
+	{
+		int				sock = PQsocket(connection);
+		fd_set			fds;
+		struct timeval	tv;
+		double			waited;
+
+		if (!PQconsumeInput(connection))
+			break;
+		if (!PQisBusy(connection))
+			break;
+
+		waited = thr_now() - start;
+		if (waited > ABORT_LOCK_GIVEUP)
+		{
+			PGcancel   *c = PQgetCancel(connection);
+			char		errbuf[256];
+
+			if (c)
+			{
+				PQcancel(c, errbuf, sizeof(errbuf));
+				PQfreeCancel(c);
+			}
+		}
+		else if (waited > ABORT_LOCK_WAIT)
+		{
+			bool		terminate = waited > 2 * ABORT_LOCK_WAIT;
+
+			res = pgut_execute_elevel(conn2, terminate ?
+				"SELECT count(*) FILTER (WHERE pg_terminate_backend(b))"
+				"  FROM unnest(pg_blocking_pids($1::int)) b"
+				"  JOIN pg_stat_activity a ON a.pid = b"
+				" WHERE a.datname = current_database()" :
+				"SELECT count(*) FILTER (WHERE pg_cancel_backend(b))"
+				"  FROM unnest(pg_blocking_pids($1::int)) b"
+				"  JOIN pg_stat_activity a ON a.pid = b"
+				" WHERE a.datname = current_database()",
+				1, params, WARNING);
+			if (PQresultStatus(res) == PGRES_TUPLES_OK && atoi(PQgetvalue(res, 0, 0)) > 0)
+				elog(WARNING, "abort cleanup: %s %s session(s) blocking the table lock",
+					 terminate ? "terminated" : "cancelled", PQgetvalue(res, 0, 0));
+			CLEARPGRES(res);
+		}
+
+		FD_ZERO(&fds);
+		FD_SET(sock, &fds);
+		tv.tv_sec = 0;
+		tv.tv_usec = 500000;
+		(void) select(sock + 1, &fds, NULL, NULL, &tv);
+	}
+
+	while ((res = PQgetResult(connection)) != NULL)
+	{
+		ok = (PQresultStatus(res) == PGRES_COMMAND_OK);
+		if (!ok)
+			elog(WARNING, "abort cleanup: LOCK failed: %s", PQerrorMessage(connection));
+		CLEARPGRES(res);
+	}
+	return ok;
 }
 
 /*

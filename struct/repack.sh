@@ -23,10 +23,28 @@
 # Stopping the job sends SIGTERM to this script (PID 1). It is forwarded to
 # pg_repack, which cancels its statements, rolls back, drops this table's
 # repack objects and exits non-zero with "pg_repack aborted cleanly: ...".
-# Keep the job's terminationGracePeriodSeconds long enough (600) for that.
+# The job's stop grace period is the platform default (30s; jobs cannot
+# change it); pg_repack bounds its abort cleanup to fit (see README.md).
 set -eu
 
-die() { echo "repack.sh: $*" >&2; exit 2; }
+die() { printf 'repack.sh: %s\n' "$*" >&2; exit 2; }
+
+# Install the stop handlers first: as PID 1, sh ignores SIGTERM unless it is
+# trapped, so a stop during the preflight checks would otherwise be lost.
+child=""
+stop_requested=""
+forward() {
+  stop_requested=$1
+  if [ -n "$child" ]; then
+    printf 'repack.sh: received %s, forwarding to pg_repack (pid %s)\n' "$1" "$child" >&2
+    kill -"$1" "$child" 2>/dev/null || true
+  else
+    printf 'repack.sh: received %s before pg_repack started; exiting\n' "$1" >&2
+    exit 143
+  fi
+}
+trap 'forward TERM' TERM
+trap 'forward INT' INT
 
 : "${REPACK_TABLE:?REPACK_TABLE is required}"
 # Character whitelist first (rules out newlines, spaces, quotes), then the
@@ -37,8 +55,8 @@ esac
 printf '%s\n' "$REPACK_TABLE" | grep -Eqx 't[a-z0-9]+\.agent_execution_steps' \
   || die "refusing table '$REPACK_TABLE': only t<tenant>.agent_execution_steps is allowed"
 : "${DATABASE_URL_DIRECT:?DATABASE_URL_DIRECT is required}"
-db=${DATABASE_URL_DIRECT##*/}   # path after the last '/'
-db=${db%%\?*}                   # drop ?sslmode=... etc.
+db=${DATABASE_URL_DIRECT%%\?*}  # drop ?sslmode=... first (it may contain '/')
+db=${db##*/}                     # then the path after the last '/' 
 [ "$db" = "edgedive" ] || die "refusing database '$db': only edgedive is allowed"
 # A query string can override the database (?dbname=...), so also ask the
 # server which database this URL really reaches.
@@ -85,20 +103,20 @@ size() {  # table name passed as a psql variable, never spliced into SQL
     | psql "$DATABASE_URL_DIRECT" -XAt -v tbl="$REPACK_TABLE" 2>/dev/null || echo "?"
 }
 
-echo "repack.sh: $(pg_repack --version)"
-echo "repack.sh: table=$REPACK_TABLE size_before=$(size)"
-echo "repack.sh: pg_repack $* (--dbname shown redacted)" | sed 's|--dbname=[^ ]*|--dbname=<DATABASE_URL_DIRECT>|' 
+printf 'repack.sh: %s\n' "$(pg_repack --version)"
+printf 'repack.sh: table=%s size_before=%s\n' "$REPACK_TABLE" "$(size)"
+# Print the arguments without the connection URL (it holds the password).
+shown=""
+for a in "$@"; do
+  case "$a" in --dbname=*) a="--dbname=<DATABASE_URL_DIRECT>" ;; esac
+  shown="$shown $a"
+done
+printf 'repack.sh: pg_repack%s\n' "$shown"
 
-# Run pg_repack as a child and forward stop signals to it. As PID 1, sh
-# would otherwise swallow SIGTERM and the copy would keep running.
+# Run pg_repack as a child; the traps above forward stop signals to it.
+[ -z "$stop_requested" ] || exit 143
 pg_repack "$@" &
 child=$!
-forward() {
-  echo "repack.sh: received $1, forwarding to pg_repack (pid $child)" >&2
-  kill -"$1" "$child" 2>/dev/null || true
-}
-trap 'forward TERM' TERM
-trap 'forward INT' INT
 
 # 'wait' returns early when a trapped signal arrives; keep waiting until the
 # child has really exited so its cleanup can finish.
@@ -110,5 +128,5 @@ while :; do
 done
 set -e
 
-echo "repack.sh: pg_repack exited with status $rc; size_after=$(size)"
+printf 'repack.sh: pg_repack exited with status %s; size_after=%s\n' "$rc" "$(size)"
 exit "$rc"

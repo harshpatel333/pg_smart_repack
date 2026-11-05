@@ -144,11 +144,19 @@ the swap committed, the line says `pg_repack interrupted after swap`. In that
 case the table *was* repacked and only the temporary objects were dropped.
 
 **Cleanup is bounded so that it fits the stop grace period.** The abort path
-waits at most 10 s for the table lock. Then it cancels the backends holding
-conflicting locks, and terminates them after 20 s. It does this **even with
-`--no-kill-backend`**. A slow lock here would otherwise end in SIGKILL, which
-leaves the trigger logging every write. In practice, only an app transaction
-that has held a lock on the table for over 10 s gets cancelled.
+requests the table lock and looks up exactly the sessions blocking that
+request (`pg_blocking_pids`, in this database only):
+
+- after 10 s it **cancels** them;
+- after 20 s it **terminates** them;
+- at 25 s it gives up and prints the FAILED line.
+
+It does this **even with `--no-kill-backend`**, because otherwise a slow lock
+ends in SIGKILL, which leaves the trigger logging every write. Other sessions
+that merely use the table are never touched. The drops inside
+`repack_drop` run with a 3 s `lock_timeout`. If nothing has been committed
+yet (a stop during setup or a pre-setup back-off), cleanup takes no lock at
+all.
 
 If cleanup fails anyway, the last line is
 `pg_repack abort cleanup FAILED … run abort-repack.sql`.
@@ -165,7 +173,7 @@ Apps *job* template in any API version we checked (2024-03-01 to 2025-07-01).
 It exists only for container apps. So the job gets the platform default
 (30 s), and `job-update.sh` does not try to set it. In local tests, cleanup
 finished within a second of SIGTERM. Under lock contention it is bounded at
-about 20 s, as described above. If a stop is ever SIGKILLed before the
+25 s, as described above. If a stop is ever SIGKILLed before the
 "aborted cleanly" line appears, run `abort-repack.sql` promptly.
 
 **Known limit:** with `--jobs` > 1, the parallel index-build workers do not

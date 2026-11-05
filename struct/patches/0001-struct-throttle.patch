@@ -12,7 +12,7 @@ index 8a56a9e..c05fbc6 100644
  PROGRAM = pg_repack
  
 diff --git a/bin/pg_repack.c b/bin/pg_repack.c
-index de67f0e..ea86fdb 100644
+index de67f0e..4ab2e48 100644
 --- a/bin/pg_repack.c
 +++ b/bin/pg_repack.c
 @@ -22,7 +22,11 @@ const char *PROGRAM_VERSION = xstr(REPACK_VERSION);
@@ -27,29 +27,32 @@ index de67f0e..ea86fdb 100644
  
  #include <errno.h>
  #include <string.h>
-@@ -222,6 +226,8 @@ static bool repack_table_indexes(PGresult *index_details);
+@@ -222,6 +226,9 @@ static bool repack_table_indexes(PGresult *index_details);
  static bool repack_all_indexes(char *errbuf, size_t errsize);
  static void repack_cleanup(bool fatal, const repack_table *table);
  static void repack_cleanup_callback(bool fatal, void *userdata);
 +static void repack_cleanup_reporter(bool fatal, void *userdata);
 +static void wait_async_interruptible(PGconn *conn);
++static bool abort_lock_table(const repack_table *table);
  static void repack_cleanup_index(bool fatal, void *userdata);
  static bool rebuild_indexes(const repack_table *table);
  
-@@ -265,6 +271,12 @@ static bool 			error_on_invalid_index = false; /* don't repack when invalid inde
+@@ -265,6 +272,14 @@ static bool 			error_on_invalid_index = false; /* don't repack when invalid inde
  static int				apply_count = APPLY_COUNT_DEFAULT;
  static int				switch_threshold = SWITCH_THRESHOLD_DEFAULT;
  
 +/* Abort cleanup: max seconds to wait for the table lock before cancelling
 + * conflicting backends (terminating them after twice this). */
 +#define ABORT_LOCK_WAIT		10
++#define ABORT_LOCK_GIVEUP	25
 +static bool				cleanup_started = false;
 +static bool				cleanup_done = false;
++static bool				setup_committed = false;	/* trigger/log may exist */
 +
  /* buffer should have at least 11 bytes */
  static char *
  utoa(unsigned int value, char *buffer)
-@@ -297,9 +309,54 @@ static pgut_option options[] =
+@@ -297,9 +312,54 @@ static pgut_option options[] =
  	{ 'b', 3, "error-on-invalid-index", &error_on_invalid_index },
  	{ 'i', 2, "apply-count", &apply_count },
  	{ 'i', 1, "switch-threshold", &switch_threshold },
@@ -104,7 +107,7 @@ index de67f0e..ea86fdb 100644
  int
  main(int argc, char *argv[])
  {
-@@ -319,10 +376,40 @@ main(int argc, char *argv[])
+@@ -319,10 +379,40 @@ main(int argc, char *argv[])
  		ereport(ERROR, (errcode(EINVAL),
  			errmsg("switch_threshold must be less than apply_count")));
  
@@ -145,7 +148,7 @@ index de67f0e..ea86fdb 100644
  
  	if (r_index.head || only_indexes)
  	{
-@@ -1050,6 +1137,7 @@ rebuild_indexes(const repack_table *table)
+@@ -1050,6 +1140,7 @@ rebuild_indexes(const repack_table *table)
  			 * index building, or if we only have one worker.
  			 */
  			command(index_jobs[i].create_index, 0, NULL);
@@ -153,7 +156,7 @@ index de67f0e..ea86fdb 100644
  
  			/* This bookkeeping isn't actually important in this no-workers
  			 * case, but just for clarity.
-@@ -1223,6 +1311,93 @@ cleanup:
+@@ -1223,6 +1314,93 @@ cleanup:
  /*
   * Re-organize one table.
   */
@@ -247,7 +250,7 @@ index de67f0e..ea86fdb 100644
  static void
  repack_one_table(repack_table *table, const char *orderby)
  {
-@@ -1280,12 +1455,30 @@ repack_one_table(repack_table *table, const char *orderby)
+@@ -1280,11 +1458,33 @@ repack_one_table(repack_table *table, const char *orderby)
  	elog(DEBUG2, "sql_update        : %s", table->sql_update);
  	elog(DEBUG2, "sql_pop           : %s", table->sql_pop);
  
@@ -257,29 +260,44 @@ index de67f0e..ea86fdb 100644
 +			errmsg("the sliced copy needs TID range scans (PostgreSQL 14 or later);"
 +				   " use --copy-slice-pages=0 on this server")));
 +
++	/* push repack_cleanup_callback() on stack to clean temporary objects.
++	 * The reporter is pushed first so that it runs after the callback (and
++	 * also when the callback fails with an error). Pushed before any
++	 * database work for this table, so every stop ends with a report. */
++	if (!dryrun)
++	{
++		cleanup_started = cleanup_done = setup_committed = false;
++		pgut_atexit_push(repack_cleanup_reporter, table);
++		pgut_atexit_push(repack_cleanup_callback, table);
++	}
++
 +	thr_begin_table(table->target_oid, table->target_name, dryrun);
 +
  	if (dryrun)
  		return;
  
 -	/* push repack_cleanup_callback() on stack to clean temporary objects */
-+	/* push repack_cleanup_callback() on stack to clean temporary objects.
-+	 * The reporter is pushed first so that it runs after the callback (and
-+	 * also when the callback fails with an error). */
-+	cleanup_started = cleanup_done = false;
-+	pgut_atexit_push(repack_cleanup_reporter, table);
- 	pgut_atexit_push(repack_cleanup_callback, table);
- 
+-	pgut_atexit_push(repack_cleanup_callback, table);
 +	/*
 +	 * Wait out any back-off before touching the table: no trigger, lock or
 +	 * snapshot exists yet, so waiting here costs nothing.
 +	 */
 +	thr_wait_backoff();
-+
+ 
  	/*
  	 * 1. Setup advisory lock and trigger on main table.
+@@ -1451,7 +1651,10 @@ repack_one_table(repack_table *table, const char *orderby)
+ 
+ 	/* We're finished killing off any unsafe DDL. COMMIT in our main
+ 	 * connection, so that conn2 may get its ShareUpdateExclusiveLock lock.
++	 * setup_committed is set first: if a cancel races the COMMIT we would
++	 * rather run a harmless repack_drop than skip a needed one.
  	 */
-@@ -1460,6 +1653,10 @@ repack_one_table(repack_table *table, const char *orderby)
++	setup_committed = true;
+ 	command("COMMIT", 0, NULL);
+ 
+ 	/* The main connection has now committed its repack_trigger,
+@@ -1460,6 +1663,10 @@ repack_one_table(repack_table *table, const char *orderby)
  	 */
  	table_init = true;
  
@@ -290,7 +308,7 @@ index de67f0e..ea86fdb 100644
  	/* Keep looping PQgetResult() calls until it returns NULL, indicating the
  	 * command is done and we have obtained our lock.
  	 */
-@@ -1485,6 +1682,7 @@ repack_one_table(repack_table *table, const char *orderby)
+@@ -1485,6 +1692,7 @@ repack_one_table(repack_table *table, const char *orderby)
  	 * 2. Copy tuples into temp table.
  	 */
  	elog(DEBUG2, "---- copy tuples ----");
@@ -298,7 +316,7 @@ index de67f0e..ea86fdb 100644
  
  	/* Must use SERIALIZABLE (or at least not READ COMMITTED) to avoid race
  	 * condition between the create_table statement and rows subsequently
-@@ -1536,7 +1734,10 @@ repack_one_table(repack_table *table, const char *orderby)
+@@ -1536,7 +1744,10 @@ repack_one_table(repack_table *table, const char *orderby)
  	command(table->create_table, 2, params);
  	if (table->alter_col_storage)
  		command(table->alter_col_storage, 0, NULL);
@@ -310,7 +328,7 @@ index de67f0e..ea86fdb 100644
  	temp_obj_num++;
  	printfStringInfo(&sql, "SELECT repack.disable_autovacuum('repack.table_%u')", table->target_oid);
  	if (table->drop_columns)
-@@ -1555,6 +1756,8 @@ repack_one_table(repack_table *table, const char *orderby)
+@@ -1555,6 +1766,8 @@ repack_one_table(repack_table *table, const char *orderby)
  	/*
  	 * 3. Create indexes on temp table.
  	 */
@@ -319,7 +337,7 @@ index de67f0e..ea86fdb 100644
  	if (!rebuild_indexes(table))
  		goto cleanup;
  
-@@ -1566,9 +1769,21 @@ repack_one_table(repack_table *table, const char *orderby)
+@@ -1566,9 +1779,21 @@ repack_one_table(repack_table *table, const char *orderby)
  	 * 4. Apply log to temp table until no tuples are left in the log
  	 * and all of the old transactions are finished.
  	 */
@@ -341,7 +359,7 @@ index de67f0e..ea86fdb 100644
  
  		/* We'll keep applying tuples from the log table in batches
  		 * of apply_count, until applying a batch of tuples
-@@ -1600,7 +1815,7 @@ repack_one_table(repack_table *table, const char *orderby)
+@@ -1600,7 +1825,7 @@ repack_one_table(repack_table *table, const char *orderby)
  			}
  
  			CLEARPGRES(res);
@@ -350,7 +368,7 @@ index de67f0e..ea86fdb 100644
  			continue;
  		}
  		else
-@@ -1617,6 +1832,10 @@ repack_one_table(repack_table *table, const char *orderby)
+@@ -1617,6 +1842,10 @@ repack_one_table(repack_table *table, const char *orderby)
  	 *    ShareUpdateExclusiveLock lock.
  	 */
  	elog(DEBUG2, "---- swap ----");
@@ -361,7 +379,7 @@ index de67f0e..ea86fdb 100644
  	/* Bump our existing ShareUpdateExclusive lock to AccessExclusive */
  
  	if (!(lock_exclusive(conn2, utoa(table->target_oid, buffer),
-@@ -1645,6 +1864,7 @@ repack_one_table(repack_table *table, const char *orderby)
+@@ -1645,6 +1874,7 @@ repack_one_table(repack_table *table, const char *orderby)
  	params[0] = utoa(table->target_oid, buffer);
  	pgut_command(conn2, "SELECT repack.repack_swap($1)", 1, params);
  	pgut_command(conn2, "COMMIT", 0, NULL);
@@ -369,7 +387,7 @@ index de67f0e..ea86fdb 100644
  
  	/*
  	 * 6. Drop.
-@@ -1687,12 +1907,15 @@ repack_one_table(repack_table *table, const char *orderby)
+@@ -1687,12 +1917,15 @@ repack_one_table(repack_table *table, const char *orderby)
  	res = pgut_execute(connection, "SELECT pg_advisory_unlock($1, CAST(-2147483648 + $2::bigint AS integer))",
  			   2, params);
  	ret = true;
@@ -385,7 +403,7 @@ index de67f0e..ea86fdb 100644
  
  	/* Rollback current transactions */
  	pgut_rollback(connection);
-@@ -1703,6 +1926,16 @@ cleanup:
+@@ -1703,6 +1936,16 @@ cleanup:
  	 */
  	if ((!ret) && table_init)
  		repack_cleanup(false, table);
@@ -402,20 +420,21 @@ index de67f0e..ea86fdb 100644
  }
  
  /* Kill off any concurrent DDL (or any transaction attempting to take
-@@ -2025,15 +2258,42 @@ repack_cleanup_callback(bool fatal, void *userdata)
+@@ -2025,9 +2268,28 @@ repack_cleanup_callback(bool fatal, void *userdata)
  
  	if(fatal)
  	{
-+		int		save_wait_timeout = wait_timeout;
-+		bool	save_no_kill_backend = no_kill_backend;
-+
 +		cleanup_started = true;
  		params[0] = utoa(target_table, buffer);
  		params[1] = utoa(temp_obj_num, num_buff);
  
-+		/* Nothing created yet (e.g. stopped during the pre-setup back-off):
-+		 * no need to lock the table just to drop nothing. */
-+		if (temp_obj_num == 0)
++		/*
++		 * Nothing committed yet (stopped before or during setup): the setup
++		 * transaction rolls back when we disconnect, so there is nothing to
++		 * drop, and no reason to lock the table or touch objects that may
++		 * belong to another pg_repack.
++		 */
++		if (!setup_committed)
 +		{
 +			cleanup_done = true;
 +			thr_report_abort(table->target_name, true);
@@ -430,36 +449,117 @@ index de67f0e..ea86fdb 100644
  		/* testing PQstatus() of connection and conn2, as we do
  		 * in repack_cleanup(), doesn't seem to work here,
  		 * so just use an unconditional reconnect().
- 		 */
+@@ -2035,17 +2297,120 @@ repack_cleanup_callback(bool fatal, void *userdata)
  		reconnect(ERROR);
  
-+		/*
-+		 * Abort cleanup must finish within the stop grace period (30s on
-+		 * Container Apps jobs), or SIGKILL leaves the trigger logging every
-+		 * write. So wait at most ABORT_LOCK_WAIT seconds for the lock, then
-+		 * cancel conflicting backends, and terminate them after twice that,
-+		 * even with --no-kill-backend.
-+		 */
-+		wait_timeout = Min(wait_timeout, ABORT_LOCK_WAIT);
-+		no_kill_backend = false;
  		command("BEGIN ISOLATION LEVEL READ COMMITTED", 0, NULL);
- 		if (!(lock_exclusive(connection, params[0], table->lock_table, false)))
+-		if (!(lock_exclusive(connection, params[0], table->lock_table, false)))
++		if (!abort_lock_table(table))
  		{
-@@ -2041,13 +2301,30 @@ repack_cleanup_callback(bool fatal, void *userdata)
- 			elog(ERROR, "lock_exclusive() failed in connection for %s during cleanup callback",
- 				 table->target_name);
+ 			pgut_rollback(connection);
+-			elog(ERROR, "lock_exclusive() failed in connection for %s during cleanup callback",
+-				 table->target_name);
++			elog(ERROR, "could not lock %s for cleanup within %ds",
++				 table->target_name, ABORT_LOCK_GIVEUP);
  		}
-+		wait_timeout = save_wait_timeout;
-+		no_kill_backend = save_no_kill_backend;
- 
+-
++		/* repack_drop also drops repack.log_<oid> / table_<oid>: bound
++		 * those lock waits too, so cleanup cannot hang past the grace. */
++		command("SET LOCAL lock_timeout = '3s'", 0, NULL);
  		command("SELECT repack.repack_drop($1, $2)", 2, params);
  		command("COMMIT", 0, NULL);
++		setup_committed = false;
  		temp_obj_num = 0; /* reset temporary object counter after cleanup */
 +		cleanup_done = true;
 +		thr_report_abort(table->target_name, true);
++	}
++}
++
++/*
++ * Take the table lock for abort cleanup within the stop grace period (30s on
++ * Container Apps jobs; a SIGKILL there leaves the trigger logging every
++ * write). The LOCK is sent asynchronously; while it waits, conn2 looks up
++ * exactly the sessions blocking it (pg_blocking_pids) and, after
++ * ABORT_LOCK_WAIT seconds, cancels them, and after twice that terminates
++ * them. Only blockers of this lock request are touched, never other users
++ * of the table. This applies even with --no-kill-backend. Gives up after
++ * ABORT_LOCK_GIVEUP seconds.
++ */
++static bool
++abort_lock_table(const repack_table *table)
++{
++	double		start = thr_now();
++	char		pidbuf[16];
++	const char *params[1];
++	PGresult   *res;
++	bool		ok = false;
++
++	snprintf(pidbuf, sizeof(pidbuf), "%d", PQbackendPID(connection));
++	params[0] = pidbuf;
++	if (!PQsendQuery(connection, table->lock_table))
++		return false;
++
++	for (;;)
++	{
++		int				sock = PQsocket(connection);
++		fd_set			fds;
++		struct timeval	tv;
++		double			waited;
++
++		if (!PQconsumeInput(connection))
++			break;
++		if (!PQisBusy(connection))
++			break;
++
++		waited = thr_now() - start;
++		if (waited > ABORT_LOCK_GIVEUP)
++		{
++			PGcancel   *c = PQgetCancel(connection);
++			char		errbuf[256];
++
++			if (c)
++			{
++				PQcancel(c, errbuf, sizeof(errbuf));
++				PQfreeCancel(c);
++			}
++		}
++		else if (waited > ABORT_LOCK_WAIT)
++		{
++			bool		terminate = waited > 2 * ABORT_LOCK_WAIT;
++
++			res = pgut_execute_elevel(conn2, terminate ?
++				"SELECT count(*) FILTER (WHERE pg_terminate_backend(b))"
++				"  FROM unnest(pg_blocking_pids($1::int)) b"
++				"  JOIN pg_stat_activity a ON a.pid = b"
++				" WHERE a.datname = current_database()" :
++				"SELECT count(*) FILTER (WHERE pg_cancel_backend(b))"
++				"  FROM unnest(pg_blocking_pids($1::int)) b"
++				"  JOIN pg_stat_activity a ON a.pid = b"
++				" WHERE a.datname = current_database()",
++				1, params, WARNING);
++			if (PQresultStatus(res) == PGRES_TUPLES_OK && atoi(PQgetvalue(res, 0, 0)) > 0)
++				elog(WARNING, "abort cleanup: %s %s session(s) blocking the table lock",
++					 terminate ? "terminated" : "cancelled", PQgetvalue(res, 0, 0));
++			CLEARPGRES(res);
++		}
++
++		FD_ZERO(&fds);
++		FD_SET(sock, &fds);
++		tv.tv_sec = 0;
++		tv.tv_usec = 500000;
++		(void) select(sock + 1, &fds, NULL, NULL, &tv);
++	}
++
++	while ((res = PQgetResult(connection)) != NULL)
++	{
++		ok = (PQresultStatus(res) == PGRES_COMMAND_OK);
++		if (!ok)
++			elog(WARNING, "abort cleanup: LOCK failed: %s", PQerrorMessage(connection));
++		CLEARPGRES(res);
  	}
- }
- 
++	return ok;
++}
++
 +/*
 + * Runs after repack_cleanup_callback(), including when that callback fails
 + * with an error: if cleanup started but did not finish, say so.
@@ -471,12 +571,10 @@ index de67f0e..ea86fdb 100644
 +
 +	if (fatal && cleanup_started && !cleanup_done)
 +		thr_report_abort(table->target_name, false);
-+}
-+
+ }
+ 
  /*
-  * The userdata pointing a table being re-organized. We need to cleanup temp
-  * objects before the program exits.
-@@ -2458,4 +2735,15 @@ pgut_help(bool details)
+@@ -2458,4 +2823,15 @@ pgut_help(bool details)
  	printf("      --error-on-invalid-index       don't repack when invalid index is found, deprecated, as this is the default behavior now\n");
  	printf("      --apply-count                  number of tuples to apply in one transaction during replay\n");
  	printf("      --switch-threshold             switch tables when that many tuples are left to catchup\n");
@@ -589,10 +687,10 @@ index 24895c9..537665c 100644
  extern bool		pgut_echo;
 diff --git a/bin/throttle.c b/bin/throttle.c
 new file mode 100644
-index 0000000..749d5c0
+index 0000000..ebe8986
 --- /dev/null
 +++ b/bin/throttle.c
-@@ -0,0 +1,1036 @@
+@@ -0,0 +1,1056 @@
 +/*
 + * throttle.c: paced copy, automatic back-off, progress reporting and the
 + * maximum-runtime guard for pg_repack (struct-throttle build).
@@ -961,14 +1059,26 @@ index 0000000..749d5c0
 +	return c;
 +}
 +
-+/* Say loudly (once per outage) that back-off is blind, then retry. */
++/* The connection is gone: say so once per outage, then retry. */
 +static void
 +mon_unavailable(const char *why)
 +{
-+	if (!mon_down)
-+		elog(WARNING, "monitoring unavailable (%s): back-off signals cannot fire"
-+			 " until it recovers; retrying every %.0fs", why, MON_RETRY_SECS);
++	if (!mon_down && !interrupted)
++		elog(WARNING, "monitoring connection lost (%s): back-off signals cannot fire"
++			 " until it reconnects; retrying every %.0fs", why, MON_RETRY_SECS);
 +	mon_down = true;
++}
++
++/* A query failed but the connection is fine: warn, at most once a minute. */
++static void
++mon_query_failed(const char *why)
++{
++	static double	warned_at = 0;
++
++	if (interrupted || thr_now() - warned_at < 60)
++		return;
++	warned_at = thr_now();
++	elog(WARNING, "monitoring query failed (%s); this sample is skipped", why);
 +}
 +
 +static PGresult *
@@ -1011,8 +1121,10 @@ index 0000000..749d5c0
 +			pgut_disconnect(monconn);
 +			monconn = NULL;
 +			mon_retry_at = 0;	/* reconnect on the next call */
++			mon_unavailable(why);
 +		}
-+		mon_unavailable(why);
++		else
++			mon_query_failed(why);
 +		return NULL;
 +	}
 +	return res;
@@ -1501,7 +1613,13 @@ index 0000000..749d5c0
 +		double	backlog = log_backlog();
 +
 +		checked_at = now;
-+		if (!full_speed && backlog >= 0 && prev_backlog >= 0 && backlog > prev_backlog)
++		if (!full_speed && backlog < 0)
++		{
++			elog(INFO, "apply: log backlog unknown (monitoring unavailable); replaying"
++				 " at full speed for the rest of this phase");
++			full_speed = true;
++		}
++		else if (!full_speed && backlog >= 0 && prev_backlog >= 0 && backlog > prev_backlog)
 +		{
 +			elog(INFO, "apply: log backlog is growing (%.0f -> %.0f rows); replaying"
 +				 " at full speed for the rest of this phase", prev_backlog, backlog);

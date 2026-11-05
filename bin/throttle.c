@@ -366,14 +366,26 @@ mon_connect(int elevel)
 	return c;
 }
 
-/* Say loudly (once per outage) that back-off is blind, then retry. */
+/* The connection is gone: say so once per outage, then retry. */
 static void
 mon_unavailable(const char *why)
 {
-	if (!mon_down)
-		elog(WARNING, "monitoring unavailable (%s): back-off signals cannot fire"
-			 " until it recovers; retrying every %.0fs", why, MON_RETRY_SECS);
+	if (!mon_down && !interrupted)
+		elog(WARNING, "monitoring connection lost (%s): back-off signals cannot fire"
+			 " until it reconnects; retrying every %.0fs", why, MON_RETRY_SECS);
 	mon_down = true;
+}
+
+/* A query failed but the connection is fine: warn, at most once a minute. */
+static void
+mon_query_failed(const char *why)
+{
+	static double	warned_at = 0;
+
+	if (interrupted || thr_now() - warned_at < 60)
+		return;
+	warned_at = thr_now();
+	elog(WARNING, "monitoring query failed (%s); this sample is skipped", why);
 }
 
 static PGresult *
@@ -416,8 +428,10 @@ mon_query(const char *sql, int nparams, const char **params)
 			pgut_disconnect(monconn);
 			monconn = NULL;
 			mon_retry_at = 0;	/* reconnect on the next call */
+			mon_unavailable(why);
 		}
-		mon_unavailable(why);
+		else
+			mon_query_failed(why);
 		return NULL;
 	}
 	return res;
@@ -906,7 +920,13 @@ thr_pace_apply(double busy_seconds)
 		double	backlog = log_backlog();
 
 		checked_at = now;
-		if (!full_speed && backlog >= 0 && prev_backlog >= 0 && backlog > prev_backlog)
+		if (!full_speed && backlog < 0)
+		{
+			elog(INFO, "apply: log backlog unknown (monitoring unavailable); replaying"
+				 " at full speed for the rest of this phase");
+			full_speed = true;
+		}
+		else if (!full_speed && backlog >= 0 && prev_backlog >= 0 && backlog > prev_backlog)
 		{
 			elog(INFO, "apply: log backlog is growing (%.0f -> %.0f rows); replaying"
 				 " at full speed for the rest of this phase", prev_backlog, backlog);
