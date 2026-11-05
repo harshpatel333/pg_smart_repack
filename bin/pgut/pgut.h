@@ -12,6 +12,7 @@
 
 #include "c.h"
 #include <assert.h>
+#include <signal.h>
 
 #ifndef WIN32
 #include <sys/time.h>
@@ -44,11 +45,13 @@ extern const char  *PROGRAM_NAME;
 extern const char  *PROGRAM_VERSION;
 extern const char  *PROGRAM_URL;
 extern const char  *PROGRAM_ISSUES;
+extern const char  *PROGRAM_BUILD_TAG;	/* optional, may be NULL */
 
 /*
  * pgut framework variables and functions
  */
 extern bool		interrupted;
+extern volatile sig_atomic_t pgut_interrupt_signo;
 extern int		pgut_log_level;
 extern int		pgut_abort_level;
 extern bool		pgut_echo;

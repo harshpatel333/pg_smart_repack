@@ -1,0 +1,1849 @@
+diff --git a/bin/Makefile b/bin/Makefile
+index 8a56a9e..c05fbc6 100644
+--- a/bin/Makefile
++++ b/bin/Makefile
+@@ -8,7 +8,7 @@
+ 
+ PG_CONFIG ?= pg_config
+ 
+-SRCS = pg_repack.c pgut/pgut.c pgut/pgut-fe.c
++SRCS = pg_repack.c throttle.c pgut/pgut.c pgut/pgut-fe.c
+ OBJS = $(SRCS:.c=.o)
+ PROGRAM = pg_repack
+ 
+diff --git a/bin/pg_repack.c b/bin/pg_repack.c
+index de67f0e..bb5bfc3 100644
+--- a/bin/pg_repack.c
++++ b/bin/pg_repack.c
+@@ -22,7 +22,11 @@ const char *PROGRAM_VERSION = xstr(REPACK_VERSION);
+ const char *PROGRAM_VERSION = "unknown";
+ #endif
+ 
++/* Our build tag: kept separate so PROGRAM_VERSION still matches the server. */
++const char *PROGRAM_BUILD_TAG = "struct-throttle 1";	/* keep in sync with THROTTLE_BUILD_TAG */
++
+ #include "pgut/pgut-fe.h"
++#include "throttle.h"
+ 
+ #include <errno.h>
+ #include <string.h>
+@@ -222,6 +226,9 @@ static bool repack_table_indexes(PGresult *index_details);
+ static bool repack_all_indexes(char *errbuf, size_t errsize);
+ static void repack_cleanup(bool fatal, const repack_table *table);
+ static void repack_cleanup_callback(bool fatal, void *userdata);
++static void repack_cleanup_reporter(bool fatal, void *userdata);
++static void wait_async_interruptible(PGconn *conn);
++static bool abort_lock_table(const repack_table *table);
+ static void repack_cleanup_index(bool fatal, void *userdata);
+ static bool rebuild_indexes(const repack_table *table);
+ 
+@@ -265,6 +272,14 @@ static bool 			error_on_invalid_index = false; /* don't repack when invalid inde
+ static int				apply_count = APPLY_COUNT_DEFAULT;
+ static int				switch_threshold = SWITCH_THRESHOLD_DEFAULT;
+ 
++/* Abort cleanup: max seconds to wait for the table lock before cancelling
++ * conflicting backends (terminating them after twice this). */
++#define ABORT_LOCK_WAIT		10
++#define ABORT_LOCK_GIVEUP	25
++static bool				cleanup_started = false;
++static bool				cleanup_done = false;
++static bool				setup_committed = false;	/* trigger/log may exist */
++
+ /* buffer should have at least 11 bytes */
+ static char *
+ utoa(unsigned int value, char *buffer)
+@@ -297,9 +312,54 @@ static pgut_option options[] =
+ 	{ 'b', 3, "error-on-invalid-index", &error_on_invalid_index },
+ 	{ 'i', 2, "apply-count", &apply_count },
+ 	{ 'i', 1, "switch-threshold", &switch_threshold },
++	/* struct-throttle options */
++	{ 'i', 10, "copy-slice-pages", &thr_copy_slice_pages },
++	{ 'f', 11, "duty-cycle", thr_setopt },
++	{ 'f', 12, "max-slice-sleep", thr_setopt },
++	{ 'i', 13, "backoff-io-waiters", &thr_backoff_io_waiters },
++	{ 'f', 14, "backoff-wal-gb", thr_setopt },
++	{ 'f', 15, "backoff-replica-lag", thr_setopt },
++	{ 'f', 16, "backoff-step", thr_setopt },
++	{ 'f', 17, "backoff-max", thr_setopt },
++	{ 'f', 18, "max-runtime", thr_setopt },
++	{ 'f', 19, "progress-interval", thr_setopt },
+ 	{ 0 },
+ };
+ 
++/* Options that only make sense with the throttled (--no-order) copy. */
++static const char *throttle_only_options[] =
++{
++	"copy-slice-pages", "duty-cycle", "max-slice-sleep", "backoff-io-waiters",
++	"backoff-wal-gb", "backoff-replica-lag", "backoff-step", "backoff-max",
++	NULL
++};
++
++/* Was option --lname given explicitly? */
++static bool
++option_given(const char *lname)
++{
++	int		i;
++
++	for (i = 0; options[i].type; i++)
++		if (strcmp(options[i].lname, lname) == 0)
++			return options[i].source != SOURCE_DEFAULT;
++	return false;
++}
++
++/* Name of the first throttle-only option given explicitly, or NULL. */
++static const char *
++throttle_option_given(void)
++{
++	int		i, j;
++
++	for (i = 0; options[i].type; i++)
++		for (j = 0; throttle_only_options[j]; j++)
++			if (strcmp(options[i].lname, throttle_only_options[j]) == 0 &&
++				options[i].source != SOURCE_DEFAULT)
++				return options[i].lname;
++	return NULL;
++}
++
+ int
+ main(int argc, char *argv[])
+ {
+@@ -319,10 +379,40 @@ main(int argc, char *argv[])
+ 		ereport(ERROR, (errcode(EINVAL),
+ 			errmsg("switch_threshold must be less than apply_count")));
+ 
++	{
++		const char *thr_err = thr_validate();
++		const char *given = throttle_option_given();
++
++		if (thr_err)
++			ereport(ERROR, (errcode(EINVAL), errmsg("%s", thr_err)));
++		/*
++		 * The sliced copy reads the table in physical (ctid) order, so it
++		 * cannot honour ORDER BY / CLUSTER. Throttling is therefore only
++		 * available in --no-order mode, and asking for it otherwise is an
++		 * error rather than a silent no-op.
++		 */
++		if (given && (r_index.head || only_indexes))
++			ereport(ERROR, (errcode(EINVAL),
++				errmsg("option --%s cannot be used when repacking indexes only", given)));
++		if (given && !noorder)
++			ereport(ERROR, (errcode(EINVAL),
++				errmsg("option --%s requires --no-order (the throttled copy cannot use ORDER BY or CLUSTER order)", given)));
++		/* As in stock pg_repack, --no-order wins over --order-by. */
++		if (noorder && orderby)
++			ereport(WARNING, (errcode(EINVAL),
++				errmsg("option --order-by is ignored with --no-order")));
++		thr_enabled = noorder && !r_index.head && !only_indexes;
++		/* Outside throttled mode behave like stock unless asked for. */
++		if (!thr_enabled && !option_given("max-runtime"))
++			thr_max_runtime = 0;
++	}
++
+ 	check_tablespace();
+ 
+ 	if (dryrun)
+ 		elog(INFO, "Dry run enabled, not executing repack");
++	else
++		thr_arm_runtime();
+ 
+ 	if (r_index.head || only_indexes)
+ 	{
+@@ -1050,6 +1140,7 @@ rebuild_indexes(const repack_table *table)
+ 			 * index building, or if we only have one worker.
+ 			 */
+ 			command(index_jobs[i].create_index, 0, NULL);
++			thr_maybe_report(false);
+ 
+ 			/* This bookkeeping isn't actually important in this no-workers
+ 			 * case, but just for clarity.
+@@ -1223,6 +1314,93 @@ cleanup:
+ /*
+  * Re-organize one table.
+  */
++/*
++ * Wait for an async query on conn to finish, staying responsive to signals:
++ * on interrupt, cancel the query and raise the usual interrupt error.
++ */
++static void
++wait_async_interruptible(PGconn *conn)
++{
++	for (;;)
++	{
++		int				sock = PQsocket(conn);
++		fd_set			fds;
++		struct timeval	tv;
++
++		if (interrupted)
++		{
++			PGcancel   *c = PQgetCancel(conn);
++			char		errbuf[256];
++
++			if (c)
++			{
++				PQcancel(c, errbuf, sizeof(errbuf));
++				PQfreeCancel(c);
++			}
++			CHECK_FOR_INTERRUPTS();
++		}
++		if (!PQconsumeInput(conn) || !PQisBusy(conn) || sock < 0)
++			return;		/* done, or an error PQgetResult() will report */
++		FD_ZERO(&fds);
++		FD_SET(sock, &fds);
++		tv.tv_sec = 0;
++		tv.tv_usec = 200000;
++		(void) select(sock + 1, &fds, NULL, NULL, &tv);	/* EINTR: loop */
++	}
++}
++
++/*
++ * Copy the table in slices of thr_copy_slice_pages heap pages, inside the
++ * caller's SERIALIZABLE copy transaction (one snapshot for all slices).
++ *
++ * Why this copies exactly what the stock single INSERT ... SELECT copies:
++ * every tuple visible to our snapshot was written by a transaction that
++ * committed before the snapshot was taken, so it lives in a block that
++ * existed then. We read the relation size after taking the snapshot, and it
++ * cannot shrink while we hold our locks (VACUUM truncation needs a lock
++ * that conflicts with conn2's SHARE UPDATE EXCLUSIVE). Blocks added later
++ * only hold tuples invisible to us; those reach the new table via the log.
++ * So [0, nblocks) under the snapshot is the complete visible set.
++ */
++static void
++copy_sliced(const repack_table *table)
++{
++	PGresult	   *res;
++	StringInfoData	sql;
++	const char	   *params[1];
++	char			buffer[12];
++	uint64			nblocks;
++	uint64			a, b;
++
++	params[0] = utoa(table->target_oid, buffer);
++	res = execute("SELECT pg_relation_size($1::oid::regclass)"
++				  " / current_setting('block_size')::bigint", 1, params);
++	nblocks = strtoull(PQgetvalue(res, 0, 0), NULL, 10);
++	CLEARPGRES(res);
++
++	thr_copy_start(nblocks);
++	thr_maybe_report(true);
++
++	initStringInfo(&sql);
++	for (a = 0; a < nblocks; a = b)
++	{
++		double	t0;
++
++		b = Min(a + (uint64) thr_copy_slice_pages, nblocks);
++		thr_wait_backoff();
++
++		printfStringInfo(&sql,
++			"%s WHERE ctid >= '(%llu,0)'::tid AND ctid < '(%llu,0)'::tid",
++			table->copy_data, (unsigned long long) a, (unsigned long long) b);
++		t0 = thr_now();
++		command(sql.data, 0, NULL);
++		thr_copy_done_pages(b);
++		thr_pace(thr_now() - t0);
++	}
++	termStringInfo(&sql);
++	thr_maybe_report(true);
++}
++
+ static void
+ repack_one_table(repack_table *table, const char *orderby)
+ {
+@@ -1280,11 +1458,33 @@ repack_one_table(repack_table *table, const char *orderby)
+ 	elog(DEBUG2, "sql_update        : %s", table->sql_update);
+ 	elog(DEBUG2, "sql_pop           : %s", table->sql_pop);
+ 
++	if (thr_enabled && thr_copy_slice_pages > 0 && !dryrun &&
++		PQserverVersion(connection) < 140000)
++		ereport(ERROR, (errcode(EINVAL),
++			errmsg("the sliced copy needs TID range scans (PostgreSQL 14 or later);"
++				   " use --copy-slice-pages=0 on this server")));
++
++	/* push repack_cleanup_callback() on stack to clean temporary objects.
++	 * The reporter is pushed first so that it runs after the callback (and
++	 * also when the callback fails with an error). Pushed before any
++	 * database work for this table, so every stop ends with a report. */
++	if (!dryrun)
++	{
++		cleanup_started = cleanup_done = setup_committed = false;
++		pgut_atexit_push(repack_cleanup_reporter, table);
++		pgut_atexit_push(repack_cleanup_callback, table);
++	}
++
++	thr_begin_table(table->target_oid, table->target_name, dryrun);
++
+ 	if (dryrun)
+ 		return;
+ 
+-	/* push repack_cleanup_callback() on stack to clean temporary objects */
+-	pgut_atexit_push(repack_cleanup_callback, table);
++	/*
++	 * Wait out any back-off before touching the table: no trigger, lock or
++	 * snapshot exists yet, so waiting here costs nothing.
++	 */
++	thr_wait_backoff();
+ 
+ 	/*
+ 	 * 1. Setup advisory lock and trigger on main table.
+@@ -1451,7 +1651,10 @@ repack_one_table(repack_table *table, const char *orderby)
+ 
+ 	/* We're finished killing off any unsafe DDL. COMMIT in our main
+ 	 * connection, so that conn2 may get its ShareUpdateExclusiveLock lock.
++	 * setup_committed is set first: if a cancel races the COMMIT we would
++	 * rather run a harmless repack_drop than skip a needed one.
+ 	 */
++	setup_committed = true;
+ 	command("COMMIT", 0, NULL);
+ 
+ 	/* The main connection has now committed its repack_trigger,
+@@ -1460,6 +1663,10 @@ repack_one_table(repack_table *table, const char *orderby)
+ 	 */
+ 	table_init = true;
+ 
++	/* Wait for the lock without blocking signals (stock blocked in
++	 * PQgetResult(), so SIGTERM was ignored while the lock was queued). */
++	wait_async_interruptible(conn2);
++
+ 	/* Keep looping PQgetResult() calls until it returns NULL, indicating the
+ 	 * command is done and we have obtained our lock.
+ 	 */
+@@ -1485,6 +1692,7 @@ repack_one_table(repack_table *table, const char *orderby)
+ 	 * 2. Copy tuples into temp table.
+ 	 */
+ 	elog(DEBUG2, "---- copy tuples ----");
++	thr_set_phase("copy");
+ 
+ 	/* Must use SERIALIZABLE (or at least not READ COMMITTED) to avoid race
+ 	 * condition between the create_table statement and rows subsequently
+@@ -1536,7 +1744,10 @@ repack_one_table(repack_table *table, const char *orderby)
+ 	command(table->create_table, 2, params);
+ 	if (table->alter_col_storage)
+ 		command(table->alter_col_storage, 0, NULL);
+-	command(table->copy_data, 0, NULL);
++	if (thr_enabled && thr_copy_slice_pages > 0)
++		copy_sliced(table);
++	else
++		command(table->copy_data, 0, NULL);
+ 	temp_obj_num++;
+ 	printfStringInfo(&sql, "SELECT repack.disable_autovacuum('repack.table_%u')", table->target_oid);
+ 	if (table->drop_columns)
+@@ -1555,6 +1766,8 @@ repack_one_table(repack_table *table, const char *orderby)
+ 	/*
+ 	 * 3. Create indexes on temp table.
+ 	 */
++	thr_set_phase("index");
++	thr_maybe_report(true);
+ 	if (!rebuild_indexes(table))
+ 		goto cleanup;
+ 
+@@ -1566,9 +1779,21 @@ repack_one_table(repack_table *table, const char *orderby)
+ 	 * 4. Apply log to temp table until no tuples are left in the log
+ 	 * and all of the old transactions are finished.
+ 	 */
++	thr_set_phase("apply");
+ 	for (;;)
+ 	{
++		double		t0;
++
++		/* Back off before each batch, pace after it (but not in the final,
++		 * locked apply_log() below, which must stay short). */
++		thr_wait_backoff();
++		t0 = thr_now();
+ 		num = apply_log(connection, table, apply_count);
++		thr_apply_done_rows(num);
++		if (num > switch_threshold)
++			thr_pace_apply(thr_now() - t0);
++		else
++			thr_maybe_report(false);
+ 
+ 		/* We'll keep applying tuples from the log table in batches
+ 		 * of apply_count, until applying a batch of tuples
+@@ -1600,7 +1825,7 @@ repack_one_table(repack_table *table, const char *orderby)
+ 			}
+ 
+ 			CLEARPGRES(res);
+-			sleep(1);
++			thr_sleep(1);
+ 			continue;
+ 		}
+ 		else
+@@ -1617,6 +1842,10 @@ repack_one_table(repack_table *table, const char *orderby)
+ 	 *    ShareUpdateExclusiveLock lock.
+ 	 */
+ 	elog(DEBUG2, "---- swap ----");
++	/* Don't let the runtime guard interrupt the (short) swap; signals still work. */
++	thr_disarm_runtime();
++	thr_set_phase("swap");
++	thr_maybe_report(true);
+ 	/* Bump our existing ShareUpdateExclusive lock to AccessExclusive */
+ 
+ 	if (!(lock_exclusive(conn2, utoa(table->target_oid, buffer),
+@@ -1645,6 +1874,7 @@ repack_one_table(repack_table *table, const char *orderby)
+ 	params[0] = utoa(table->target_oid, buffer);
+ 	pgut_command(conn2, "SELECT repack.repack_swap($1)", 1, params);
+ 	pgut_command(conn2, "COMMIT", 0, NULL);
++	thr_set_phase("drop");
+ 
+ 	/*
+ 	 * 6. Drop.
+@@ -1687,12 +1917,15 @@ repack_one_table(repack_table *table, const char *orderby)
+ 	res = pgut_execute(connection, "SELECT pg_advisory_unlock($1, CAST(-2147483648 + $2::bigint AS integer))",
+ 			   2, params);
+ 	ret = true;
++	thr_set_phase("done");
++	thr_maybe_report(true);
+ 
+ cleanup:
+ 	CLEARPGRES(res);
+ 	termStringInfo(&sql);
+ 	if (vxid)
+ 		free(vxid);
++	thr_end_table();
+ 
+ 	/* Rollback current transactions */
+ 	pgut_rollback(connection);
+@@ -1703,6 +1936,16 @@ cleanup:
+ 	 */
+ 	if ((!ret) && table_init)
+ 		repack_cleanup(false, table);
++
++	/* This table is finished or cleaned up: its callbacks must not run
++	 * again for a later table (stock 1.5.3 never popped them). */
++	pgut_atexit_pop(repack_cleanup_callback, table);
++	pgut_atexit_pop(repack_cleanup_reporter, table);
++
++	/* The guard was disarmed for the swap. Re-arm it only now that this
++	 * table is finished (or cleaned up), so an expired deadline stops the
++	 * next table instead of failing this one after its swap. */
++	thr_rearm_runtime();
+ }
+ 
+ /* Kill off any concurrent DDL (or any transaction attempting to take
+@@ -2025,9 +2268,28 @@ repack_cleanup_callback(bool fatal, void *userdata)
+ 
+ 	if(fatal)
+ 	{
++		cleanup_started = true;
+ 		params[0] = utoa(target_table, buffer);
+ 		params[1] = utoa(temp_obj_num, num_buff);
+ 
++		/*
++		 * Nothing committed yet (stopped before or during setup): the setup
++		 * transaction rolls back when we disconnect, so there is nothing to
++		 * drop, and no reason to lock the table or touch objects that may
++		 * belong to another pg_repack.
++		 */
++		if (!setup_committed)
++		{
++			cleanup_done = true;
++			thr_report_abort(table->target_name, true);
++			return;
++		}
++
++		/* Say what is happening before the (possibly slow) lock wait. */
++		elog(INFO, "aborting: reason=%s phase=%s; rolling back and dropping"
++			 " temporary objects for %s", thr_abort_reason(), thr_get_phase(),
++			 table->target_name);
++
+ 		/* testing PQstatus() of connection and conn2, as we do
+ 		 * in repack_cleanup(), doesn't seem to work here,
+ 		 * so just use an unconditional reconnect().
+@@ -2035,19 +2297,129 @@ repack_cleanup_callback(bool fatal, void *userdata)
+ 		reconnect(ERROR);
+ 
+ 		command("BEGIN ISOLATION LEVEL READ COMMITTED", 0, NULL);
+-		if (!(lock_exclusive(connection, params[0], table->lock_table, false)))
++		if (!abort_lock_table(table))
+ 		{
+ 			pgut_rollback(connection);
+-			elog(ERROR, "lock_exclusive() failed in connection for %s during cleanup callback",
+-				 table->target_name);
++			elog(ERROR, "could not lock %s for cleanup within %ds",
++				 table->target_name, ABORT_LOCK_GIVEUP);
+ 		}
+-
++		/* repack_drop also drops repack.log_<oid> / table_<oid>: bound
++		 * those lock waits too, so cleanup cannot hang past the grace. */
++		command("SET LOCAL lock_timeout = '3s'", 0, NULL);
+ 		command("SELECT repack.repack_drop($1, $2)", 2, params);
+ 		command("COMMIT", 0, NULL);
++		setup_committed = false;
+ 		temp_obj_num = 0; /* reset temporary object counter after cleanup */
++		cleanup_done = true;
++		thr_report_abort(table->target_name, true);
+ 	}
+ }
+ 
++/*
++ * Take the table lock for abort cleanup within the stop grace period (30s on
++ * Container Apps jobs; a SIGKILL there leaves the trigger logging every
++ * write). The LOCK is sent asynchronously; while it waits, conn2 looks up
++ * exactly the sessions blocking it (pg_blocking_pids) and, after
++ * ABORT_LOCK_WAIT seconds, cancels them, and after twice that terminates
++ * them. Only blockers of this lock request are touched, never other users
++ * of the table. This applies even with --no-kill-backend. Gives up after
++ * ABORT_LOCK_GIVEUP seconds.
++ */
++static bool
++abort_lock_table(const repack_table *table)
++{
++	double		start = thr_now();
++	char		pidbuf[16];
++	const char *params[1];
++	PGresult   *res;
++	bool		ok = false;
++	int			logged_stage = 0;	/* 1 = cancel logged, 2 = terminate logged */
++
++	snprintf(pidbuf, sizeof(pidbuf), "%d", PQbackendPID(connection));
++	params[0] = pidbuf;
++	if (!PQsendQuery(connection, table->lock_table))
++		return false;
++
++	for (;;)
++	{
++		int				sock = PQsocket(connection);
++		fd_set			fds;
++		struct timeval	tv;
++		double			waited;
++
++		if (!PQconsumeInput(connection))
++			break;
++		if (!PQisBusy(connection))
++			break;
++
++		waited = thr_now() - start;
++		if (waited > ABORT_LOCK_GIVEUP)
++		{
++			PGcancel   *c = PQgetCancel(connection);
++			char		errbuf[256];
++
++			if (c)
++			{
++				PQcancel(c, errbuf, sizeof(errbuf));
++				PQfreeCancel(c);
++			}
++		}
++		else if (waited > ABORT_LOCK_WAIT)
++		{
++			bool		terminate = waited > 2 * ABORT_LOCK_WAIT;
++
++			res = pgut_execute_elevel(conn2, terminate ?
++				"SELECT count(*) FILTER (WHERE pg_terminate_backend(b))"
++				"  FROM unnest(pg_blocking_pids($1::int)) b"
++				"  JOIN pg_stat_activity a ON a.pid = b"
++				" WHERE a.datname = current_database()" :
++				"SELECT count(*) FILTER (WHERE pg_cancel_backend(b))"
++				"  FROM unnest(pg_blocking_pids($1::int)) b"
++				"  JOIN pg_stat_activity a ON a.pid = b"
++				" WHERE a.datname = current_database()",
++				1, params, WARNING);
++			/* Log once per stage (cancel is re-sent every tick, and an idle
++			 * blocker "accepts" every cancel without effect). */
++			if (PQresultStatus(res) == PGRES_TUPLES_OK && atoi(PQgetvalue(res, 0, 0)) > 0 &&
++				logged_stage < (terminate ? 2 : 1))
++			{
++				elog(WARNING, "abort cleanup: %s %s session(s) blocking the table lock",
++					 terminate ? "terminating" : "cancelling", PQgetvalue(res, 0, 0));
++				logged_stage = terminate ? 2 : 1;
++			}
++			CLEARPGRES(res);
++		}
++
++		FD_ZERO(&fds);
++		FD_SET(sock, &fds);
++		tv.tv_sec = 0;
++		tv.tv_usec = 500000;
++		(void) select(sock + 1, &fds, NULL, NULL, &tv);
++	}
++
++	while ((res = PQgetResult(connection)) != NULL)
++	{
++		ok = (PQresultStatus(res) == PGRES_COMMAND_OK);
++		if (!ok)
++			elog(WARNING, "abort cleanup: LOCK failed: %s", PQerrorMessage(connection));
++		CLEARPGRES(res);
++	}
++	return ok;
++}
++
++/*
++ * Runs after repack_cleanup_callback(), including when that callback fails
++ * with an error: if cleanup started but did not finish, say so.
++ */
++static void
++repack_cleanup_reporter(bool fatal, void *userdata)
++{
++	repack_table *table = (repack_table *) userdata;
++
++	if (fatal && cleanup_started && !cleanup_done)
++		thr_report_abort(table->target_name, false);
++}
++
+ /*
+  * The userdata pointing a table being re-organized. We need to cleanup temp
+  * objects before the program exits.
+@@ -2458,4 +2830,15 @@ pgut_help(bool details)
+ 	printf("      --error-on-invalid-index       don't repack when invalid index is found, deprecated, as this is the default behavior now\n");
+ 	printf("      --apply-count                  number of tuples to apply in one transaction during replay\n");
+ 	printf("      --switch-threshold             switch tables when that many tuples are left to catchup\n");
++	printf("\nThrottling (struct-throttle; copy options need --no-order; 0 disables a knob):\n");
++	printf("      --copy-slice-pages=N           heap pages copied per slice (default %d, 0 = one statement)\n", THR_DEFAULT_COPY_SLICE_PAGES);
++	printf("      --duty-cycle=X                 fraction of time spent working, 0<X<=1 (default %.2f, 1 = no pacing)\n", THR_DEFAULT_DUTY_CYCLE);
++	printf("      --max-slice-sleep=DUR          cap on the pause after one slice/batch (default %.0fs)\n", THR_DEFAULT_MAX_SLICE_SLEEP);
++	printf("      --backoff-io-waiters=N         pause while >= N other backends wait on IO (default %d)\n", THR_DEFAULT_BACKOFF_IO_WAITERS);
++	printf("      --backoff-wal-gb=G             pause while pg_wal holds >= G GB (default %.0f)\n", THR_DEFAULT_BACKOFF_WAL_GB);
++	printf("      --backoff-replica-lag=DUR      pause while a replica's replay_lag >= DUR (default %.0fs)\n", THR_DEFAULT_BACKOFF_REPLICA_LAG);
++	printf("      --backoff-step=DUR             re-check interval while backing off (default %.0fs)\n", THR_DEFAULT_BACKOFF_STEP);
++	printf("      --backoff-max=DUR              warn every step once one back-off lasts longer (default %.0fs)\n", THR_DEFAULT_BACKOFF_MAX);
++	printf("      --max-runtime=DUR              abort and clean up after DUR (default 4h, 0 = no limit)\n");
++	printf("      --progress-interval=DUR        progress line interval (default %.0fs, 0 = off)\n", THR_DEFAULT_PROGRESS_INTERVAL);
+ }
+diff --git a/bin/pgut/pgut-fe.c b/bin/pgut/pgut-fe.c
+index b47b1bb..486d7c0 100644
+--- a/bin/pgut/pgut-fe.c
++++ b/bin/pgut/pgut-fe.c
+@@ -716,7 +716,10 @@ pgut_getopt(int argc, char **argv, pgut_option options[])
+ 		}
+ 		if (strcmp(argv[1], "--version") == 0 || strcmp(argv[1], "-V") == 0)
+ 		{
+-			printf("%s %s\n", PROGRAM_NAME, PROGRAM_VERSION);
++			if (PROGRAM_BUILD_TAG)
++				printf("%s %s (%s)\n", PROGRAM_NAME, PROGRAM_VERSION, PROGRAM_BUILD_TAG);
++			else
++				printf("%s %s\n", PROGRAM_NAME, PROGRAM_VERSION);
+ 			exit(0);
+ 		}
+ 		if (strcmp(argv[1], "--configuration") == 0)
+diff --git a/bin/pgut/pgut.c b/bin/pgut/pgut.c
+index 106d8dd..a409b2c 100644
+--- a/bin/pgut/pgut.c
++++ b/bin/pgut/pgut.c
+@@ -42,8 +42,10 @@ static pthread_mutex_t		pgut_conn_mutex;
+ 
+ const char *PROGRAM_NAME = NULL;
+ 
+-/* Interrupted by SIGINT (Ctrl+C) ? */
++/* Interrupted by SIGINT (Ctrl+C), SIGTERM or SIGALRM ? */
+ bool		interrupted = false;
++/* The first signal that interrupted us (0 if none). */
++volatile sig_atomic_t pgut_interrupt_signo = 0;
+ static bool	in_cleanup = false;
+ 
+ /* log min messages */
+@@ -806,8 +808,12 @@ pgut_wait(int num, PGconn *connections[], struct timeval *timeout)
+ void
+ CHECK_FOR_INTERRUPTS(void)
+ {
++	/*
++	 * ERROR rather than FATAL: both run the cleanup callbacks, but FATAL then
++	 * calls abort(), which dumps core and hides the clean exit status.
++	 */
+ 	if (interrupted && !in_cleanup)
+-		ereport(FATAL, (errcode(EINTR), errmsg("interrupted")));
++		ereport(ERROR, (errcode(EINTR), errmsg("interrupted")));
+ }
+ 
+ /*
+@@ -1611,13 +1617,22 @@ wait_for_sockets(int nfds, fd_set *fds, struct timeval *timeout)
+ static void
+ handle_sigint(SIGNAL_ARGS)
+ {
++	if (pgut_interrupt_signo == 0)
++		pgut_interrupt_signo = postgres_signal_arg;
+ 	on_interrupt();
+ }
+ 
++/*
++ * SIGTERM is what container runtimes send on stop; SIGALRM is used by
++ * pg_repack's --max-runtime guard. All three cancel the running statements
++ * and lead to the normal cleanup path.
++ */
+ static void
+ init_cancel_handler(void)
+ {
+ 	pqsignal(SIGINT, handle_sigint);
++	pqsignal(SIGTERM, handle_sigint);
++	pqsignal(SIGALRM, handle_sigint);
+ }
+ #else							/* WIN32 */
+ 
+diff --git a/bin/pgut/pgut.h b/bin/pgut/pgut.h
+index 24895c9..537665c 100644
+--- a/bin/pgut/pgut.h
++++ b/bin/pgut/pgut.h
+@@ -12,6 +12,7 @@
+ 
+ #include "c.h"
+ #include <assert.h>
++#include <signal.h>
+ 
+ #ifndef WIN32
+ #include <sys/time.h>
+@@ -44,11 +45,13 @@ extern const char  *PROGRAM_NAME;
+ extern const char  *PROGRAM_VERSION;
+ extern const char  *PROGRAM_URL;
+ extern const char  *PROGRAM_ISSUES;
++extern const char  *PROGRAM_BUILD_TAG;	/* optional, may be NULL */
+ 
+ /*
+  * pgut framework variables and functions
+  */
+ extern bool		interrupted;
++extern volatile sig_atomic_t pgut_interrupt_signo;
+ extern int		pgut_log_level;
+ extern int		pgut_abort_level;
+ extern bool		pgut_echo;
+diff --git a/bin/throttle.c b/bin/throttle.c
+new file mode 100644
+index 0000000..ebe8986
+--- /dev/null
++++ b/bin/throttle.c
+@@ -0,0 +1,1056 @@
++/*
++ * throttle.c: paced copy, automatic back-off, progress reporting and the
++ * maximum-runtime guard for pg_repack (struct-throttle build).
++ *
++ * See throttle.h. All database access for monitoring goes through a
++ * separate autocommit connection ("monconn"): pg_stat_activity and
++ * pg_stat_replication are cached for the duration of a transaction, so they
++ * cannot be sampled from inside pg_repack's long copy transaction.
++ */
++#include "pgut/pgut-fe.h"
++#include "throttle.h"
++
++#include <errno.h>
++#include <math.h>
++#include <signal.h>
++#include <string.h>
++#include <time.h>
++#include <unistd.h>
++#include <sys/time.h>
++
++#define GB	(1024.0 * 1024.0 * 1024.0)
++#define MB	(1024.0 * 1024.0)
++
++/* Minimum seconds between two samples of the monitoring metrics. */
++#define METRICS_MIN_AGE		1.0
++/* Granularity of interruptible sleeps. */
++#define SLEEP_CHUNK			0.2
++/* Heap pages sampled for the informational live-size estimate. */
++#define SIZE_SAMPLE_PAGES	2000.0
++
++int		thr_copy_slice_pages = THR_DEFAULT_COPY_SLICE_PAGES;
++double	thr_duty_cycle = THR_DEFAULT_DUTY_CYCLE;
++double	thr_max_slice_sleep = THR_DEFAULT_MAX_SLICE_SLEEP;
++int		thr_backoff_io_waiters = THR_DEFAULT_BACKOFF_IO_WAITERS;
++double	thr_backoff_wal_gb = THR_DEFAULT_BACKOFF_WAL_GB;
++double	thr_backoff_replica_lag = THR_DEFAULT_BACKOFF_REPLICA_LAG;
++double	thr_backoff_step = THR_DEFAULT_BACKOFF_STEP;
++double	thr_backoff_max = THR_DEFAULT_BACKOFF_MAX;
++double	thr_max_runtime = THR_DEFAULT_MAX_RUNTIME;
++double	thr_progress_interval = THR_DEFAULT_PROGRESS_INTERVAL;
++bool	thr_enabled = false;
++
++/*
++ * Informational lines (settings, size, progress) are printed only in
++ * throttled mode, and never under pg_regress, so stock output is unchanged.
++ */
++static bool
++thr_chatty(void)
++{
++	static int	under_regress = -1;
++
++	if (under_regress < 0)
++	{
++		const char *app = getenv("PGAPPNAME");
++
++		under_regress = (app && strncmp(app, "pg_regress", 10) == 0);
++	}
++	return thr_enabled && !under_regress;
++}
++
++/* runtime guard */
++static double	run_deadline = 0;		/* 0 = no deadline */
++
++/* per-table state */
++static PGconn  *monconn = NULL;
++static bool		mon_active = false;	/* monitoring wanted for this table */
++static bool		mon_down = false;	/* warned that monitoring is unavailable */
++static double	mon_retry_at = 0;
++static int		mon_pid = 0;
++#define MON_RETRY_SECS	10.0
++static Oid		cur_oid = InvalidOid;
++static char	   *cur_name = NULL;
++static int		own_pids[8];
++static int		n_own_pids = 0;
++static bool		wal_ok = false;
++
++static const char *phase = "setup";
++static double	phase_start = 0;
++static uint64	copy_total = 0;
++static uint64	copy_done = 0;
++static double	copy_start = 0;
++static long		apply_rows = 0;
++
++/* apply pacing (thr_pace_apply) */
++static double	prev_backlog = -1;
++static bool		full_speed = false;
++static double	checked_at = 0;
++
++/* reporting */
++static double	last_report = 0;
++static double	last_bytes = -1;
++static double	last_bytes_at = 0;
++
++/* current back-off episode */
++static const char *backoff_reason = NULL;
++static double	backoff_value = 0;
++
++/* last metrics sample */
++static double	metrics_at = 0;
++static double	m_wal_bytes = -1;
++static int		m_io_waiters = -1;
++static double	m_replica_lag = -1;
++static double	m_snap_secs = -1;
++static double	m_snap_xids = -1;
++
++double
++thr_now(void)
++{
++	struct timeval tv;
++
++	gettimeofday(&tv, NULL);
++	return tv.tv_sec + tv.tv_usec / 1e6;
++}
++
++/* ------------------------------------------------------------------------
++ * option parsing
++ * ------------------------------------------------------------------------ */
++
++/* Parse "500ms", "30", "30s", "10m", "10min", "4h", "1.5h", "1d". */
++static bool
++parse_duration(const char *arg, double *out)
++{
++	char	   *end;
++	double		v;
++
++	errno = 0;
++	v = strtod(arg, &end);
++	if (end == arg || errno != 0 || v < 0 || !isfinite(v))
++		return false;
++	while (*end == ' ')
++		end++;
++	if (*end == '\0' || strcmp(end, "s") == 0 || strcmp(end, "sec") == 0)
++		;
++	else if (strcmp(end, "ms") == 0)
++		v /= 1000.0;
++	else if (strcmp(end, "m") == 0 || strcmp(end, "min") == 0)
++		v *= 60.0;
++	else if (strcmp(end, "h") == 0)
++		v *= 3600.0;
++	else if (strcmp(end, "d") == 0)
++		v *= 86400.0;
++	else
++		return false;
++	*out = v;
++	return true;
++}
++
++static bool
++parse_number(const char *arg, double *out)
++{
++	char	   *end;
++	double		v;
++
++	errno = 0;
++	v = strtod(arg, &end);
++	if (end == arg || *end != '\0' || errno != 0 || !isfinite(v))
++		return false;
++	*out = v;
++	return true;
++}
++
++typedef struct
++{
++	const char *lname;
++	double	   *var;
++	bool		duration;	/* accepts unit suffixes */
++} thr_dbl_opt;
++
++static thr_dbl_opt dbl_opts[] =
++{
++	{"duty-cycle", &thr_duty_cycle, false},
++	{"max-slice-sleep", &thr_max_slice_sleep, true},
++	{"backoff-wal-gb", &thr_backoff_wal_gb, false},
++	{"backoff-replica-lag", &thr_backoff_replica_lag, true},
++	{"backoff-step", &thr_backoff_step, true},
++	{"backoff-max", &thr_backoff_max, true},
++	{"max-runtime", &thr_max_runtime, true},
++	{"progress-interval", &thr_progress_interval, true},
++	{NULL, NULL, false}
++};
++
++void
++thr_setopt(pgut_option *opt, const char *arg)
++{
++	thr_dbl_opt *o;
++
++	for (o = dbl_opts; o->lname; o++)
++	{
++		if (strcmp(o->lname, opt->lname) != 0)
++			continue;
++		if (arg == NULL ||
++			!(o->duration ? parse_duration(arg, o->var) : parse_number(arg, o->var)))
++			ereport(ERROR,
++				(errcode(EINVAL),
++				 errmsg("option --%s should be %s: '%s'", opt->lname,
++						o->duration ? "a duration such as 30s, 10m or 4h" : "a number",
++						arg ? arg : "")));
++		return;
++	}
++	ereport(ERROR, (errcode(EINVAL), errmsg("unknown option --%s", opt->lname)));
++}
++
++const char *
++thr_validate(void)
++{
++	if (thr_copy_slice_pages < 0)
++		return "--copy-slice-pages must be >= 0 (0 copies in one statement)";
++	if (!(thr_duty_cycle > 0 && thr_duty_cycle <= 1))
++		return "--duty-cycle must be > 0 and <= 1 (1 disables pacing)";
++	if (thr_max_slice_sleep < 0)
++		return "--max-slice-sleep must be >= 0";
++	if (thr_backoff_io_waiters < 0)
++		return "--backoff-io-waiters must be >= 0 (0 disables it)";
++	if (thr_backoff_wal_gb < 0)
++		return "--backoff-wal-gb must be >= 0 (0 disables it)";
++	if (thr_backoff_replica_lag < 0)
++		return "--backoff-replica-lag must be >= 0 (0 disables it)";
++	if (thr_backoff_step <= 0)
++		return "--backoff-step must be > 0";
++	if (thr_backoff_max < 0)
++		return "--backoff-max must be >= 0";
++	if (thr_max_runtime < 0 || thr_max_runtime > 365 * 86400.0)
++		return "--max-runtime must be between 0 (disabled) and 365d";
++	if (thr_progress_interval < 0)
++		return "--progress-interval must be >= 0 (0 disables progress lines)";
++	return NULL;
++}
++
++/* ------------------------------------------------------------------------
++ * formatting helpers
++ * ------------------------------------------------------------------------ */
++
++static const char *
++fmt_dur(double secs, char *buf, size_t len)
++{
++	long	s;
++
++	if (secs < 0 || !isfinite(secs))
++	{
++		snprintf(buf, len, "?");
++		return buf;
++	}
++	s = (long) (secs + 0.5);
++	if (s >= 3600)
++		snprintf(buf, len, "%ldh%02ldm", s / 3600, (s % 3600) / 60);
++	else if (s >= 60)
++		snprintf(buf, len, "%ldm%02lds", s / 60, s % 60);
++	else
++		snprintf(buf, len, "%lds", s);
++	return buf;
++}
++
++static const char *
++fmt_gb(double bytes, char *buf, size_t len)
++{
++	if (bytes < 0)
++		snprintf(buf, len, "n/a");
++	else
++		snprintf(buf, len, "%.2fGB", bytes / GB);
++	return buf;
++}
++
++/* ------------------------------------------------------------------------
++ * max-runtime guard
++ *
++ * SIGALRM is handled by pgut like SIGINT/SIGTERM: running statements are
++ * cancelled and the next CHECK_FOR_INTERRUPTS() raises an error, which runs
++ * the cleanup callback. pgut_interrupt_signo == SIGALRM marks the reason.
++ * ------------------------------------------------------------------------ */
++
++static void
++set_alarm(double secs)
++{
++	struct itimerval it;
++
++	memset(&it, 0, sizeof(it));
++	if (secs > 0)
++	{
++		it.it_value.tv_sec = (time_t) secs;
++		it.it_value.tv_usec = (suseconds_t) ((secs - floor(secs)) * 1e6);
++		if (it.it_value.tv_sec == 0 && it.it_value.tv_usec == 0)
++			it.it_value.tv_usec = 1;
++	}
++	setitimer(ITIMER_REAL, &it, NULL);
++}
++
++void
++thr_arm_runtime(void)
++{
++	char	buf[32];
++
++	if (thr_max_runtime <= 0)
++		return;
++	run_deadline = thr_now() + thr_max_runtime;
++	set_alarm(thr_max_runtime);
++	if (thr_chatty())
++		elog(INFO, "max-runtime guard armed: %s", fmt_dur(thr_max_runtime, buf, sizeof(buf)));
++}
++
++/* Called right before the swap: the swap must not be interrupted by the
++ * runtime guard (signals are still honoured). */
++void
++thr_disarm_runtime(void)
++{
++	if (run_deadline > 0)
++		set_alarm(0);
++}
++
++void
++thr_rearm_runtime(void)
++{
++	double	left;
++
++	if (run_deadline <= 0)
++		return;
++	left = run_deadline - thr_now();
++	set_alarm(left > 0.001 ? left : 0.001);
++}
++
++/* ------------------------------------------------------------------------
++ * monitoring connection and metrics
++ * ------------------------------------------------------------------------ */
++
++void
++thr_add_own_pid(PGconn *conn)
++{
++	if (conn && n_own_pids < (int) lengthof(own_pids))
++	{
++		int		pid = PQbackendPID(conn);
++		int		i;
++
++		for (i = 0; i < n_own_pids; i++)
++			if (own_pids[i] == pid)
++				return;
++		own_pids[n_own_pids++] = pid;
++	}
++}
++
++static const char *
++own_pids_array(char *buf, size_t len)
++{
++	int		i;
++	size_t	off = 0;
++
++	off += snprintf(buf + off, len - off, "{%d", mon_pid);
++	for (i = 0; i < n_own_pids && off < len; i++)
++		off += snprintf(buf + off, len - off, ",%d", own_pids[i]);
++	if (off < len)
++		snprintf(buf + off, len - off, "}");
++	return buf;
++}
++
++/* Open the monitoring connection; NULL (with a message at elevel) on failure. */
++static PGconn *
++mon_connect(int elevel)
++{
++	PGconn	   *c = pgut_connect(dbname, host, port, username, password,
++								 prompt_password, elevel);
++
++	if (c)
++	{
++		pgut_command(c, "SET statement_timeout = '30s'", 0, NULL);
++		pgut_command(c, "SET lock_timeout = '5s'", 0, NULL);
++		mon_pid = PQbackendPID(c);
++	}
++	return c;
++}
++
++/* The connection is gone: say so once per outage, then retry. */
++static void
++mon_unavailable(const char *why)
++{
++	if (!mon_down && !interrupted)
++		elog(WARNING, "monitoring connection lost (%s): back-off signals cannot fire"
++			 " until it reconnects; retrying every %.0fs", why, MON_RETRY_SECS);
++	mon_down = true;
++}
++
++/* A query failed but the connection is fine: warn, at most once a minute. */
++static void
++mon_query_failed(const char *why)
++{
++	static double	warned_at = 0;
++
++	if (interrupted || thr_now() - warned_at < 60)
++		return;
++	warned_at = thr_now();
++	elog(WARNING, "monitoring query failed (%s); this sample is skipped", why);
++}
++
++static PGresult *
++mon_query(const char *sql, int nparams, const char **params)
++{
++	PGresult   *res;
++
++	if (!mon_active)
++		return NULL;
++	if (monconn && PQstatus(monconn) != CONNECTION_OK)
++	{
++		pgut_disconnect(monconn);
++		monconn = NULL;
++	}
++	if (!monconn)
++	{
++		if (thr_now() < mon_retry_at)
++			return NULL;
++		mon_retry_at = thr_now() + MON_RETRY_SECS;
++		monconn = mon_connect(DEBUG2);
++		if (!monconn)
++		{
++			mon_unavailable("cannot reconnect");
++			return NULL;
++		}
++		if (mon_down)
++			elog(INFO, "monitoring connection re-established; back-off signals active again");
++		mon_down = false;
++	}
++	res = pgut_execute_elevel(monconn, sql, nparams, params, DEBUG2);
++	if (PQresultStatus(res) != PGRES_TUPLES_OK)
++	{
++		char		why[160];
++
++		snprintf(why, sizeof(why), "%s", PQerrorMessage(monconn));
++		why[strcspn(why, "\n")] = '\0';
++		CLEARPGRES(res);
++		if (PQstatus(monconn) != CONNECTION_OK)
++		{
++			pgut_disconnect(monconn);
++			monconn = NULL;
++			mon_retry_at = 0;	/* reconnect on the next call */
++			mon_unavailable(why);
++		}
++		else
++			mon_query_failed(why);
++		return NULL;
++	}
++	return res;
++}
++
++static double
++getdbl(PGresult *res, int row, int col, double dflt)
++{
++	if (PQgetisnull(res, row, col))
++		return dflt;
++	return atof(PQgetvalue(res, row, col));
++}
++
++static void
++refresh_metrics(bool force)
++{
++	PGresult   *res;
++	char		pids[128];
++	const char *params[1];
++	double		now = thr_now();
++
++	if (!mon_active || (!force && now - metrics_at < METRICS_MIN_AGE))
++		return;
++	metrics_at = now;
++
++	params[0] = own_pids_array(pids, sizeof(pids));
++	res = mon_query(
++		"SELECT"
++		" (SELECT count(*) FROM pg_stat_activity"
++		"   WHERE state = 'active' AND wait_event_type = 'IO'"
++		"     AND backend_type IN ('client backend', 'parallel worker')"
++		"     AND pid <> ALL ($1::int[])"
++		"     AND coalesce(leader_pid, 0) <> ALL ($1::int[])),"
++		" (SELECT coalesce(extract(epoch FROM max(replay_lag)), 0)"
++		"    FROM pg_stat_replication),"
++		" (SELECT extract(epoch FROM max(now() - xact_start))"
++		"    FROM pg_stat_activity"
++		"   WHERE pid = ANY ($1::int[]) AND backend_xmin IS NOT NULL),"
++		" (SELECT max(age(backend_xmin))"
++		"    FROM pg_stat_activity WHERE pid = ANY ($1::int[]))",
++		1, params);
++	if (res)
++	{
++		m_io_waiters = (int) getdbl(res, 0, 0, -1);
++		m_replica_lag = getdbl(res, 0, 1, -1);
++		m_snap_secs = getdbl(res, 0, 2, 0);
++		m_snap_xids = getdbl(res, 0, 3, 0);
++		CLEARPGRES(res);
++	}
++	else
++	{
++		/* Unknown, not "last seen": a stale value could pin a back-off. */
++		m_io_waiters = -1;
++		m_replica_lag = -1;
++		m_snap_secs = m_snap_xids = -1;
++	}
++
++	if (wal_ok)
++	{
++		res = mon_query("SELECT coalesce(sum(size), 0) FROM pg_ls_waldir()", 0, NULL);
++		if (res)
++		{
++			m_wal_bytes = getdbl(res, 0, 0, -1);
++			CLEARPGRES(res);
++		}
++		else
++			m_wal_bytes = -1;
++	}
++}
++
++/* Informational size line, for planning only (not a gate). */
++static void
++log_size_estimate(Oid oid, const char *name)
++{
++	PGresult   *res;
++	char		oidbuf[16];
++	const char *params[1];
++	double		total, heap, toast, idx, nblocks, pct, live = -1;
++	char		b1[32], b2[32], b3[32], b4[32], b5[32], b6[32];
++	StringInfoData sql;
++
++	snprintf(oidbuf, sizeof(oidbuf), "%u", oid);
++	params[0] = oidbuf;
++	res = mon_query(
++		"SELECT pg_total_relation_size(c.oid), pg_relation_size(c.oid),"
++		"       coalesce(pg_total_relation_size(nullif(c.reltoastrelid, 0)), 0),"
++		"       pg_indexes_size(c.oid),"
++		"       pg_relation_size(c.oid) / current_setting('block_size')::bigint,"
++		"       (SELECT string_agg(format('coalesce(pg_column_size(%I), 0)', attname),"
++		"                          ' + ' ORDER BY attnum)"
++		"          FROM pg_attribute"
++		"         WHERE attrelid = c.oid AND attnum > 0 AND NOT attisdropped)"
++		"  FROM pg_class c WHERE c.oid = $1::oid",
++		1, params);
++	if (!res || PQntuples(res) != 1)
++	{
++		CLEARPGRES(res);
++		return;
++	}
++	total = getdbl(res, 0, 0, 0);
++	heap = getdbl(res, 0, 1, 0);
++	toast = getdbl(res, 0, 2, 0);
++	idx = getdbl(res, 0, 3, 0);
++	nblocks = getdbl(res, 0, 4, 0);
++
++	if (!PQgetisnull(res, 0, 5) && nblocks > 0)
++	{
++		/*
++		 * pg_column_size() of a TOASTed value is its stored size, read from
++		 * the TOAST pointer without fetching the value, so this samples
++		 * heap pages only. 24 bytes approximates the tuple header.
++		 */
++		PGresult *r2;
++
++		pct = Min(100.0, 100.0 * SIZE_SAMPLE_PAGES / nblocks);
++		initStringInfo(&sql);
++		appendStringInfo(&sql,
++			"SELECT coalesce(sum(24 + %s), 0)::float8 FROM ONLY %s"
++			" TABLESAMPLE SYSTEM (%.6f) REPEATABLE (7151)",
++			PQgetvalue(res, 0, 5), name, pct);
++		r2 = mon_query(sql.data, 0, NULL);
++		if (r2)
++		{
++			live = getdbl(r2, 0, 0, 0) * 100.0 / pct;
++			CLEARPGRES(r2);
++		}
++		termStringInfo(&sql);
++	}
++	CLEARPGRES(res);
++
++	elog(INFO, "size (informational, not a gate): table=%s on_disk=%s"
++		 " (heap %s, toast %s, indexes %s)",
++		 name, fmt_gb(total, b1, 32), fmt_gb(heap, b2, 32),
++		 fmt_gb(toast, b3, 32), fmt_gb(idx, b4, 32));
++	if (live >= 0)
++		elog(INFO, "size: live_estimate=%s (sampled ~%.0f of %.0f heap pages);"
++			 " projected_peak_extra=%s (live + indexes %s + ~%.0fGB WAL)",
++			 fmt_gb(live, b5, 32), Min(SIZE_SAMPLE_PAGES, nblocks), nblocks,
++			 fmt_gb(live + idx + THR_WAL_ALLOWANCE_GB * GB, b6, 32),
++			 fmt_gb(idx, b4, 32), THR_WAL_ALLOWANCE_GB);
++}
++
++void
++thr_begin_table(Oid target_oid, const char *target_name, bool dryrun)
++{
++	PGresult   *res;
++
++	cur_oid = target_oid;
++	if (cur_name)
++		free(cur_name);
++	cur_name = pgut_strdup(target_name);
++	n_own_pids = 0;
++	copy_total = copy_done = 0;
++	apply_rows = 0;
++	prev_backlog = -1;
++	full_speed = false;
++	checked_at = 0;
++	last_bytes = -1;
++	backoff_reason = NULL;
++	metrics_at = 0;
++	m_wal_bytes = -1;
++	m_io_waiters = -1;
++	m_replica_lag = -1;
++	m_snap_secs = m_snap_xids = -1;
++	wal_ok = false;
++	thr_set_phase("setup");
++
++	/* Stock (ordered) mode: no monitoring connection, no extra output. */
++	if (!thr_enabled)
++		return;
++
++	if (!monconn)
++		monconn = mon_connect(ERROR);
++	mon_active = true;
++	mon_down = false;
++	thr_add_own_pid(connection);
++	thr_add_own_pid(conn2);
++
++	if (thr_chatty())
++	{
++		elog(INFO, "throttle: copy_slice_pages=%d duty_cycle=%.2f max_slice_sleep=%.0fs"
++			 " backoff_io_waiters=%d backoff_wal_gb=%.1f backoff_replica_lag=%.0fs"
++			 " backoff_step=%.0fs backoff_max=%.0fs progress_interval=%.0fs",
++			 thr_copy_slice_pages, thr_duty_cycle, thr_max_slice_sleep,
++			 thr_backoff_io_waiters, thr_backoff_wal_gb, thr_backoff_replica_lag,
++			 thr_backoff_step, thr_backoff_max, thr_progress_interval);
++		log_size_estimate(target_oid, target_name);
++	}
++
++	/* Can we read the WAL directory size? (pg_monitor or superuser) */
++	res = pgut_execute_elevel(monconn,
++		"SELECT coalesce(sum(size), 0) FROM pg_ls_waldir()", 0, NULL, DEBUG2);
++	wal_ok = (PQresultStatus(res) == PGRES_TUPLES_OK);
++	if (!wal_ok && thr_chatty() && thr_backoff_wal_gb > 0)
++	{
++		char	why[200];
++
++		snprintf(why, sizeof(why), "%s", PQresultErrorMessage(res));
++		why[strcspn(why, "\n")] = '\0';
++		elog(WARNING, "cannot read the WAL directory size (%s); the --backoff-wal-gb"
++			 " signal is disabled for this run", why);
++	}
++	CLEARPGRES(res);
++
++	/*
++	 * Checkpoints keep pg_wal at up to max_wal_size (plus wal_keep_size and
++	 * slot retention) even when idle, so a threshold at or below that can
++	 * hold a back-off - and the copy snapshot - until --max-runtime.
++	 */
++	if (wal_ok && thr_chatty() && thr_backoff_wal_gb > 0)
++	{
++		res = pgut_execute_elevel(monconn,
++			"SELECT (pg_size_bytes(current_setting('max_wal_size'))"
++			"      + pg_size_bytes(current_setting('wal_keep_size'))) / 1024.0^3,"
++			"       (SELECT sum(size) FROM pg_ls_waldir()) / 1024.0^3",
++			0, NULL, DEBUG2);
++		if (PQresultStatus(res) == PGRES_TUPLES_OK)
++		{
++			double	steady = getdbl(res, 0, 0, 0);
++			double	now_gb = getdbl(res, 0, 1, 0);
++
++			if (thr_backoff_wal_gb <= steady)
++				elog(WARNING, "--backoff-wal-gb=%.1f is at or below max_wal_size +"
++					 " wal_keep_size (%.1fGB): pg_wal can stay that large at steady"
++					 " state and hold the back-off until --max-runtime",
++					 thr_backoff_wal_gb, steady);
++			elog(INFO, "wal: pg_wal=%.1fGB now, max_wal_size+wal_keep_size=%.1fGB,"
++				 " back-off threshold=%.1fGB", now_gb, steady, thr_backoff_wal_gb);
++		}
++		CLEARPGRES(res);
++	}
++
++	/* Without pg_read_all_stats, other roles' wait events and replay_lag are hidden. */
++	res = pgut_execute_elevel(monconn,
++		"SELECT pg_has_role('pg_read_all_stats', 'member')"
++		"    OR (SELECT rolsuper FROM pg_roles WHERE rolname = current_user)",
++		0, NULL, DEBUG2);
++	if (PQresultStatus(res) == PGRES_TUPLES_OK && strcmp(PQgetvalue(res, 0, 0), "t") != 0 &&
++		thr_chatty() && (thr_backoff_io_waiters > 0 || thr_backoff_replica_lag > 0))
++		elog(WARNING, "role is not a member of pg_read_all_stats: the io-waiters and"
++			 " replica-lag signals only see this role's own sessions");
++	CLEARPGRES(res);
++
++	if (dryrun)
++	{
++		thr_end_table();
++		return;
++	}
++}
++
++void
++thr_end_table(void)
++{
++	mon_active = false;
++	if (monconn)
++	{
++		pgut_disconnect(monconn);
++		monconn = NULL;
++	}
++}
++
++/* ------------------------------------------------------------------------
++ * progress
++ * ------------------------------------------------------------------------ */
++
++void
++thr_set_phase(const char *p)
++{
++	phase = p;
++	phase_start = thr_now();
++	last_report = 0;	/* report early in each new phase */
++	last_bytes = -1;
++}
++
++const char *
++thr_get_phase(void)
++{
++	return phase;
++}
++
++void
++thr_copy_start(uint64 total_pages)
++{
++	copy_total = total_pages;
++	copy_done = 0;
++	copy_start = thr_now();
++	if (thr_chatty())
++		elog(INFO, "copying %llu heap pages in slices of %d pages",
++			 (unsigned long long) total_pages, thr_copy_slice_pages);
++}
++
++void
++thr_copy_done_pages(uint64 pages_done)
++{
++	copy_done = pages_done;
++}
++
++void
++thr_apply_done_rows(int rows)
++{
++	apply_rows += rows;
++}
++
++/* Size of repack.table_<oid> plus TOAST and indexes. Must be safe to run
++ * inside the copy transaction: to_regclass() never errors. */
++static double
++temp_table_bytes(void)
++{
++	PGresult   *res;
++	char		sql[160];
++	double		v = -1;
++
++	if (!connection || PQtransactionStatus(connection) == PQTRANS_INERROR ||
++		PQtransactionStatus(connection) == PQTRANS_ACTIVE)
++		return -1;
++	snprintf(sql, sizeof(sql),
++			 "SELECT pg_total_relation_size(to_regclass('repack.table_%u'))", cur_oid);
++	if (PQtransactionStatus(connection) == PQTRANS_INTRANS)
++	{
++		/* Inside the copy transaction: a savepoint keeps any failure here
++		 * from aborting the copy. */
++		bool	ok;
++
++		if (pgut_command(connection, "SAVEPOINT repack_progress", 0, NULL) != PGRES_COMMAND_OK)
++			return -1;
++		res = pgut_execute_elevel(connection, sql, 0, NULL, DEBUG2);
++		ok = (PQresultStatus(res) == PGRES_TUPLES_OK);
++		if (ok)
++			v = getdbl(res, 0, 0, -1);
++		CLEARPGRES(res);
++		pgut_command(connection, ok ? "RELEASE SAVEPOINT repack_progress"
++					 : "ROLLBACK TO SAVEPOINT repack_progress", 0, NULL);
++		return v;
++	}
++	res = pgut_execute_elevel(connection, sql, 0, NULL, DEBUG2);
++	if (PQresultStatus(res) == PGRES_TUPLES_OK)
++		v = getdbl(res, 0, 0, -1);
++	CLEARPGRES(res);
++	return v;
++}
++
++/* Approximate number of rows waiting in repack.log_<oid>. */
++static double
++log_backlog(void)
++{
++	PGresult   *res;
++	char		sql[200];
++	double		v = -1;
++
++	snprintf(sql, sizeof(sql),
++			 "SELECT coalesce(max(id) - min(id) + 1, 0) FROM repack.log_%u", cur_oid);
++	res = mon_query(sql, 0, NULL);
++	if (res)
++	{
++		v = getdbl(res, 0, 0, -1);
++		CLEARPGRES(res);
++	}
++	return v;
++}
++
++void
++thr_maybe_report(bool force)
++{
++	double		now = thr_now();
++	double		bytes, rate = -1;
++	char		b1[32], b2[32], b3[32], b4[32], b5[32];
++	StringInfoData line;
++
++	if (thr_progress_interval <= 0 || !mon_active || !thr_chatty())
++		return;
++	if (!force && last_report > 0 && now - last_report < thr_progress_interval)
++		return;
++	last_report = now;
++
++	refresh_metrics(true);
++	bytes = temp_table_bytes();
++	if (bytes >= 0 && last_bytes >= 0 && now > last_bytes_at)
++		rate = (bytes - last_bytes) / (now - last_bytes_at);
++	if (bytes >= 0)
++	{
++		last_bytes = bytes;
++		last_bytes_at = now;
++	}
++
++	initStringInfo(&line);
++	appendStringInfo(&line, "progress: table=%s phase=%s", cur_name ? cur_name : "?", phase);
++	if (strcmp(phase, "copy") == 0 && copy_total > 0)
++	{
++		double	elapsed = now - copy_start;
++		double	eta = -1;
++
++		if (copy_done > 0 && elapsed > 0)
++			eta = (copy_total - copy_done) / (copy_done / elapsed);
++		appendStringInfo(&line, " pages=%llu/%llu (%.1f%%) eta=%s",
++						 (unsigned long long) copy_done,
++						 (unsigned long long) copy_total,
++						 100.0 * copy_done / copy_total,
++						 fmt_dur(eta, b1, sizeof(b1)));
++	}
++	else if (strcmp(phase, "apply") == 0)
++		appendStringInfo(&line, " applied_rows=%ld log_backlog=%.0f",
++						 apply_rows, log_backlog());
++	appendStringInfo(&line, " written=%s", fmt_gb(bytes, b2, sizeof(b2)));
++	if (rate >= 0)
++		appendStringInfo(&line, " rate=%.1fMB/s", rate / MB);
++	else
++		appendStringInfoString(&line, " rate=n/a");
++	appendStringInfo(&line, " phase_elapsed=%s", fmt_dur(now - phase_start, b3, sizeof(b3)));
++	if (backoff_reason)
++		appendStringInfo(&line, " backoff=%s(%.1f)", backoff_reason, backoff_value);
++	else
++		appendStringInfoString(&line, " backoff=none");
++	appendStringInfo(&line, " wal=%s io_waiters=%d replica_lag=%.1fs snapshot_age=%s xmin_age=%.0f",
++					 fmt_gb(m_wal_bytes, b4, sizeof(b4)), m_io_waiters,
++					 m_replica_lag, fmt_dur(m_snap_secs, b5, sizeof(b5)), m_snap_xids);
++	elog(INFO, "%s", line.data);
++	termStringInfo(&line);
++}
++
++/* ------------------------------------------------------------------------
++ * pacing and back-off
++ * ------------------------------------------------------------------------ */
++
++/* Sleep without blocking signals: wakes up every SLEEP_CHUNK to check for
++ * an interrupt and to emit progress lines. */
++void
++thr_sleep(double seconds)
++{
++	double		end = thr_now() + seconds;
++
++	for (;;)
++	{
++		double			left;
++		struct timespec	ts;
++
++		CHECK_FOR_INTERRUPTS();
++		left = end - thr_now();
++		if (left <= 0)
++			break;
++		if (left > SLEEP_CHUNK)
++			left = SLEEP_CHUNK;
++		ts.tv_sec = (time_t) left;
++		ts.tv_nsec = (long) ((left - ts.tv_sec) * 1e9);
++		nanosleep(&ts, NULL);	/* EINTR is fine: we re-check above */
++		thr_maybe_report(false);
++	}
++	CHECK_FOR_INTERRUPTS();
++}
++
++void
++thr_pace(double busy_seconds)
++{
++	double		s;
++
++	if (!thr_enabled || thr_duty_cycle >= 1.0 || busy_seconds <= 0)
++	{
++		thr_maybe_report(false);
++		return;
++	}
++	s = busy_seconds * (1.0 / thr_duty_cycle - 1.0);
++	if (thr_max_slice_sleep > 0 && s > thr_max_slice_sleep)
++		s = thr_max_slice_sleep;
++	thr_sleep(s);
++}
++
++/*
++ * Pacing for replay batches. Pacing helps only with the backlog that piled up
++ * during the copy; in steady state replay writes no more than the app does.
++ * So the first time the backlog grows between samples (the app is writing
++ * faster than paced replay drains it), pacing is switched off for the rest of
++ * the apply phase. Flipping back and forth would let the backlog hover and
++ * never converge before --max-runtime.
++ */
++void
++thr_pace_apply(double busy_seconds)
++{
++	double			now = thr_now();
++
++	if (!thr_enabled || thr_duty_cycle >= 1.0)
++	{
++		thr_maybe_report(false);
++		return;
++	}
++	if (now - checked_at >= METRICS_MIN_AGE)
++	{
++		double	backlog = log_backlog();
++
++		checked_at = now;
++		if (!full_speed && backlog < 0)
++		{
++			elog(INFO, "apply: log backlog unknown (monitoring unavailable); replaying"
++				 " at full speed for the rest of this phase");
++			full_speed = true;
++		}
++		else if (!full_speed && backlog >= 0 && prev_backlog >= 0 && backlog > prev_backlog)
++		{
++			elog(INFO, "apply: log backlog is growing (%.0f -> %.0f rows); replaying"
++				 " at full speed for the rest of this phase", prev_backlog, backlog);
++			full_speed = true;
++		}
++		prev_backlog = backlog;
++	}
++	if (full_speed)
++		thr_maybe_report(false);
++	else
++		thr_pace(busy_seconds);
++}
++
++static const char *
++check_backoff(double *value)
++{
++	refresh_metrics(false);
++	if (thr_backoff_io_waiters > 0 && m_io_waiters >= thr_backoff_io_waiters)
++	{
++		*value = m_io_waiters;
++		return "io-waiters";
++	}
++	if (wal_ok && thr_backoff_wal_gb > 0 && m_wal_bytes >= thr_backoff_wal_gb * GB)
++	{
++		*value = m_wal_bytes / GB;
++		return "wal-gb";
++	}
++	if (thr_backoff_replica_lag > 0 && m_replica_lag >= thr_backoff_replica_lag)
++	{
++		*value = m_replica_lag;
++		return "replica-lag";
++	}
++	return NULL;
++}
++
++void
++thr_wait_backoff(void)
++{
++	double		episode_start = 0;
++	const char *reason;
++	double		value = 0;
++	char		b1[32];
++
++	CHECK_FOR_INTERRUPTS();
++	if (!thr_enabled || !mon_active ||
++		(thr_backoff_io_waiters <= 0 && thr_backoff_wal_gb <= 0 &&
++		 thr_backoff_replica_lag <= 0))
++	{
++		thr_maybe_report(false);
++		return;
++	}
++
++	for (;;)
++	{
++		reason = check_backoff(&value);
++		if (!reason)
++			break;
++
++		if (episode_start == 0)
++		{
++			episode_start = thr_now();
++			elog(INFO, "back-off: phase=%s signal=%s value=%.1f; pausing",
++				 phase, reason, value);
++		}
++		else if (reason != backoff_reason)
++			elog(INFO, "back-off: phase=%s signal=%s value=%.1f; still pausing",
++				 phase, reason, value);
++		else if (thr_backoff_max > 0 && thr_now() - episode_start > thr_backoff_max)
++			elog(WARNING, "back-off has lasted %s (> --backoff-max): signal=%s value=%.1f;"
++				 " still waiting",
++				 fmt_dur(thr_now() - episode_start, b1, sizeof(b1)), reason, value);
++		backoff_reason = reason;
++		backoff_value = value;
++
++		thr_sleep(thr_backoff_step);
++		metrics_at = 0;		/* force a fresh sample */
++	}
++
++	if (episode_start > 0)
++		elog(INFO, "back-off cleared after %s; resuming %s",
++			 fmt_dur(thr_now() - episode_start, b1, sizeof(b1)), phase);
++	backoff_reason = NULL;
++	thr_maybe_report(false);
++}
++
++/* ------------------------------------------------------------------------
++ * abort reporting
++ * ------------------------------------------------------------------------ */
++
++const char *
++thr_abort_reason(void)
++{
++	switch (pgut_interrupt_signo)
++	{
++		case 0:
++			return "error";
++		case SIGALRM:
++			return "max-runtime";
++		case SIGTERM:
++			return "SIGTERM";
++		case SIGINT:
++			return "SIGINT";
++		default:
++			return "signal";
++	}
++}
++
++void
++thr_report_abort(const char *table_name, bool cleaned)
++{
++	bool	swapped = (strcmp(phase, "drop") == 0 || strcmp(phase, "done") == 0);
++
++	if (cleaned && swapped)
++		fprintf(stderr, "pg_repack interrupted after swap: reason=%s table=%s"
++				" (the table was repacked; temporary objects dropped)\n",
++				thr_abort_reason(), table_name);
++	else if (cleaned)
++		fprintf(stderr, "pg_repack aborted cleanly: reason=%s table=%s phase=%s"
++				" copied_pages=%llu/%llu\n",
++				thr_abort_reason(), table_name, phase,
++				(unsigned long long) copy_done, (unsigned long long) copy_total);
++	else
++		fprintf(stderr, "pg_repack abort cleanup FAILED: reason=%s table=%s phase=%s;"
++				" temporary objects may be left behind, run abort-repack.sql\n",
++				thr_abort_reason(), table_name, phase);
++	fflush(stderr);
++}
+diff --git a/bin/throttle.h b/bin/throttle.h
+new file mode 100644
+index 0000000..ed21055
+--- /dev/null
++++ b/bin/throttle.h
+@@ -0,0 +1,85 @@
++/*
++ * throttle.h: paced copy, automatic back-off, progress reporting and the
++ * maximum-runtime guard for pg_repack (struct-throttle build).
++ *
++ * Everything here is client-side only. It works against the stock
++ * pg_repack server extension: the only server objects used are the ones
++ * the stock client already uses, plus built-in functions and views.
++ */
++#ifndef REPACK_THROTTLE_H
++#define REPACK_THROTTLE_H
++
++#include "pgut/pgut-fe.h"
++
++/* Printed by --version next to the (unchanged) REPACK_VERSION. */
++#define THROTTLE_BUILD_TAG "struct-throttle 1"
++
++/* Defaults. Every knob can be turned off with 0 (duty cycle: 1). */
++#define THR_DEFAULT_COPY_SLICE_PAGES	1024
++#define THR_DEFAULT_DUTY_CYCLE			0.33
++#define THR_DEFAULT_MAX_SLICE_SLEEP		30.0		/* seconds */
++#define THR_DEFAULT_BACKOFF_IO_WAITERS	16
++#define THR_DEFAULT_BACKOFF_WAL_GB		35.0
++#define THR_DEFAULT_BACKOFF_REPLICA_LAG	60.0		/* seconds */
++#define THR_DEFAULT_BACKOFF_STEP		10.0		/* seconds */
++#define THR_DEFAULT_BACKOFF_MAX			600.0		/* seconds */
++#define THR_DEFAULT_MAX_RUNTIME			(4 * 3600.0)	/* seconds */
++#define THR_DEFAULT_PROGRESS_INTERVAL	60.0		/* seconds */
++
++/* Rule-of-thumb WAL allowance used only in the informational size line. */
++#define THR_WAL_ALLOWANCE_GB			20.0
++
++/* Settings (set from the command line by pg_repack.c). */
++extern int		thr_copy_slice_pages;
++extern double	thr_duty_cycle;
++extern double	thr_max_slice_sleep;
++extern int		thr_backoff_io_waiters;
++extern double	thr_backoff_wal_gb;
++extern double	thr_backoff_replica_lag;
++extern double	thr_backoff_step;
++extern double	thr_backoff_max;
++extern double	thr_max_runtime;
++extern double	thr_progress_interval;
++
++/*
++ * True when pacing, slicing and back-off are active. Decided in main():
++ * only in --no-order mode.
++ */
++extern bool		thr_enabled;
++
++/* Option callback ('f' type) for every duration / fractional option. */
++extern void thr_setopt(pgut_option *opt, const char *arg);
++
++/* Validate settings; returns NULL if fine, else an error message. */
++extern const char *thr_validate(void);
++
++/* Max-runtime guard. */
++extern void thr_arm_runtime(void);
++extern void thr_disarm_runtime(void);
++extern void thr_rearm_runtime(void);
++
++/* Per-table lifecycle. */
++extern void thr_begin_table(Oid target_oid, const char *target_name, bool dryrun);
++extern void thr_end_table(void);
++extern void thr_add_own_pid(PGconn *conn);
++
++/* Progress. Phases: "setup", "copy", "index", "apply", "swap", "drop". */
++extern void thr_set_phase(const char *phase);
++extern const char *thr_get_phase(void);
++extern void thr_copy_start(uint64 total_pages);
++extern void thr_copy_done_pages(uint64 pages_done);
++extern void thr_apply_done_rows(int rows);
++extern void thr_maybe_report(bool force);
++
++/* Pacing and back-off. */
++extern void thr_wait_backoff(void);
++extern void thr_pace(double busy_seconds);
++extern void thr_pace_apply(double busy_seconds);
++extern void thr_sleep(double seconds);
++extern double thr_now(void);
++
++/* Abort reporting. */
++extern const char *thr_abort_reason(void);
++extern void thr_report_abort(const char *table_name, bool cleaned);
++
++#endif   /* REPACK_THROTTLE_H */

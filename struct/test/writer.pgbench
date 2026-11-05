@@ -1,0 +1,29 @@
+-- Concurrent app-like writer. Each statement updates the shadow table in the
+-- same statement, so steps and shadow stay consistent whatever the repack does.
+\set r random(1, 100)
+\set k random(1, 2000000000)
+\set e random(1, 2000)
+\if :r <= 50
+-- insert a new snapshot
+WITH ins AS (
+  INSERT INTO t1test.agent_execution_steps (id, execution_id, sequence, meta, payload)
+  VALUES ('w-' || :client_id || '-' || nextval('t1test.step_seq'), 'e-' || :e, nextval('t1test.step_seq'),
+          repeat(md5(:k::text), 18), t1test.mkpayload(t1test.rndsize(), :k))
+  RETURNING id, md5(payload::text) AS h)
+INSERT INTO t1test.shadow SELECT id, h FROM ins;
+\elif :r <= 80
+-- archiver-style delete of the oldest rows
+WITH d AS (
+  DELETE FROM t1test.agent_execution_steps WHERE id IN (
+    SELECT id FROM t1test.agent_execution_steps ORDER BY created_at LIMIT 2 FOR UPDATE SKIP LOCKED)
+  RETURNING id)
+DELETE FROM t1test.shadow WHERE id IN (SELECT id FROM d);
+\else
+-- update the payload of a random existing row (inline or toasted)
+WITH u AS (
+  UPDATE t1test.agent_execution_steps SET payload = jsonb_set(payload, '{seed}', to_jsonb(:k)),
+         meta = repeat(md5((:k + 1)::text), 18)
+  WHERE id = 's-' || (1 + 2 * (:k % :nrows))
+  RETURNING id, md5(payload::text) AS h)
+UPDATE t1test.shadow s SET h = u.h FROM u WHERE s.id = u.id;
+\endif

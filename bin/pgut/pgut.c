@@ -42,8 +42,10 @@ static pthread_mutex_t		pgut_conn_mutex;
 
 const char *PROGRAM_NAME = NULL;
 
-/* Interrupted by SIGINT (Ctrl+C) ? */
+/* Interrupted by SIGINT (Ctrl+C), SIGTERM or SIGALRM ? */
 bool		interrupted = false;
+/* The first signal that interrupted us (0 if none). */
+volatile sig_atomic_t pgut_interrupt_signo = 0;
 static bool	in_cleanup = false;
 
 /* log min messages */
@@ -806,8 +808,12 @@ pgut_wait(int num, PGconn *connections[], struct timeval *timeout)
 void
 CHECK_FOR_INTERRUPTS(void)
 {
+	/*
+	 * ERROR rather than FATAL: both run the cleanup callbacks, but FATAL then
+	 * calls abort(), which dumps core and hides the clean exit status.
+	 */
 	if (interrupted && !in_cleanup)
-		ereport(FATAL, (errcode(EINTR), errmsg("interrupted")));
+		ereport(ERROR, (errcode(EINTR), errmsg("interrupted")));
 }
 
 /*
@@ -1611,13 +1617,22 @@ wait_for_sockets(int nfds, fd_set *fds, struct timeval *timeout)
 static void
 handle_sigint(SIGNAL_ARGS)
 {
+	if (pgut_interrupt_signo == 0)
+		pgut_interrupt_signo = postgres_signal_arg;
 	on_interrupt();
 }
 
+/*
+ * SIGTERM is what container runtimes send on stop; SIGALRM is used by
+ * pg_repack's --max-runtime guard. All three cancel the running statements
+ * and lead to the normal cleanup path.
+ */
 static void
 init_cancel_handler(void)
 {
 	pqsignal(SIGINT, handle_sigint);
+	pqsignal(SIGTERM, handle_sigint);
+	pqsignal(SIGALRM, handle_sigint);
 }
 #else							/* WIN32 */
 

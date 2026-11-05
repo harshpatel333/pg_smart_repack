@@ -8,7 +8,7 @@
 
 PG_CONFIG ?= pg_config
 
-SRCS = pg_repack.c pgut/pgut.c pgut/pgut-fe.c
+SRCS = pg_repack.c throttle.c pgut/pgut.c pgut/pgut-fe.c
 OBJS = $(SRCS:.c=.o)
 PROGRAM = pg_repack
 
