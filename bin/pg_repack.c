@@ -22,7 +22,11 @@ const char *PROGRAM_VERSION = xstr(REPACK_VERSION);
 const char *PROGRAM_VERSION = "unknown";
 #endif
 
+/* Our build tag: kept separate so PROGRAM_VERSION still matches the server. */
+const char *PROGRAM_BUILD_TAG = "struct-throttle 1";	/* keep in sync with THROTTLE_BUILD_TAG */
+
 #include "pgut/pgut-fe.h"
+#include "throttle.h"
 
 #include <errno.h>
 #include <string.h>
@@ -297,8 +301,41 @@ static pgut_option options[] =
 	{ 'b', 3, "error-on-invalid-index", &error_on_invalid_index },
 	{ 'i', 2, "apply-count", &apply_count },
 	{ 'i', 1, "switch-threshold", &switch_threshold },
+	/* struct-throttle options */
+	{ 'i', 10, "copy-slice-pages", &thr_copy_slice_pages },
+	{ 'f', 11, "duty-cycle", thr_setopt },
+	{ 'f', 12, "max-slice-sleep", thr_setopt },
+	{ 'i', 13, "backoff-io-waiters", &thr_backoff_io_waiters },
+	{ 'f', 14, "backoff-wal-gb", thr_setopt },
+	{ 'f', 15, "backoff-replica-lag", thr_setopt },
+	{ 'f', 16, "backoff-step", thr_setopt },
+	{ 'f', 17, "backoff-max", thr_setopt },
+	{ 'f', 18, "max-runtime", thr_setopt },
+	{ 'f', 19, "progress-interval", thr_setopt },
 	{ 0 },
 };
+
+/* Options that only make sense with the throttled (--no-order) copy. */
+static const char *throttle_only_options[] =
+{
+	"copy-slice-pages", "duty-cycle", "max-slice-sleep", "backoff-io-waiters",
+	"backoff-wal-gb", "backoff-replica-lag", "backoff-step", "backoff-max",
+	NULL
+};
+
+/* Name of the first throttle-only option given explicitly, or NULL. */
+static const char *
+throttle_option_given(void)
+{
+	int		i, j;
+
+	for (i = 0; options[i].type; i++)
+		for (j = 0; throttle_only_options[j]; j++)
+			if (strcmp(options[i].lname, throttle_only_options[j]) == 0 &&
+				options[i].source != SOURCE_DEFAULT)
+				return options[i].lname;
+	return NULL;
+}
 
 int
 main(int argc, char *argv[])
@@ -319,10 +356,33 @@ main(int argc, char *argv[])
 		ereport(ERROR, (errcode(EINVAL),
 			errmsg("switch_threshold must be less than apply_count")));
 
+	{
+		const char *thr_err = thr_validate();
+		const char *given = throttle_option_given();
+
+		if (thr_err)
+			ereport(ERROR, (errcode(EINVAL), errmsg("%s", thr_err)));
+		/*
+		 * The sliced copy reads the table in physical (ctid) order, so it
+		 * cannot honour ORDER BY / CLUSTER. Throttling is therefore only
+		 * available in --no-order mode, and asking for it otherwise is an
+		 * error rather than a silent no-op.
+		 */
+		if (given && (r_index.head || only_indexes))
+			ereport(ERROR, (errcode(EINVAL),
+				errmsg("option --%s cannot be used when repacking indexes only", given)));
+		if (given && (!noorder || orderby))
+			ereport(ERROR, (errcode(EINVAL),
+				errmsg("option --%s requires --no-order (the throttled copy cannot use ORDER BY or CLUSTER order)", given)));
+		thr_enabled = noorder && !orderby && !r_index.head && !only_indexes;
+	}
+
 	check_tablespace();
 
 	if (dryrun)
 		elog(INFO, "Dry run enabled, not executing repack");
+	else
+		thr_arm_runtime();
 
 	if (r_index.head || only_indexes)
 	{
@@ -1050,6 +1110,7 @@ rebuild_indexes(const repack_table *table)
 			 * index building, or if we only have one worker.
 			 */
 			command(index_jobs[i].create_index, 0, NULL);
+			thr_maybe_report(false);
 
 			/* This bookkeeping isn't actually important in this no-workers
 			 * case, but just for clarity.
@@ -1223,6 +1284,58 @@ cleanup:
 /*
  * Re-organize one table.
  */
+/*
+ * Copy the table in slices of thr_copy_slice_pages heap pages, inside the
+ * caller's SERIALIZABLE copy transaction (one snapshot for all slices).
+ *
+ * Why this copies exactly what the stock single INSERT ... SELECT copies:
+ * every tuple visible to our snapshot was written by a transaction that
+ * committed before the snapshot was taken, so it lives in a block that
+ * existed then. We read the relation size after taking the snapshot, and it
+ * cannot shrink while we hold our locks (VACUUM truncation needs a lock
+ * that conflicts with conn2's SHARE UPDATE EXCLUSIVE). Blocks added later
+ * only hold tuples invisible to us; those reach the new table via the log.
+ * So [0, nblocks) under the snapshot is the complete visible set.
+ */
+static void
+copy_sliced(const repack_table *table)
+{
+	PGresult	   *res;
+	StringInfoData	sql;
+	const char	   *params[1];
+	char			buffer[12];
+	uint64			nblocks;
+	uint64			a, b;
+
+	params[0] = utoa(table->target_oid, buffer);
+	res = execute("SELECT pg_relation_size($1::oid::regclass)"
+				  " / current_setting('block_size')::bigint", 1, params);
+	nblocks = strtoull(PQgetvalue(res, 0, 0), NULL, 10);
+	CLEARPGRES(res);
+
+	thr_copy_start(nblocks);
+	thr_maybe_report(true);
+
+	initStringInfo(&sql);
+	for (a = 0; a < nblocks; a = b)
+	{
+		double	t0;
+
+		b = Min(a + (uint64) thr_copy_slice_pages, nblocks);
+		thr_wait_backoff();
+
+		printfStringInfo(&sql,
+			"%s WHERE ctid >= '(%llu,0)'::tid AND ctid < '(%llu,0)'::tid",
+			table->copy_data, (unsigned long long) a, (unsigned long long) b);
+		t0 = thr_now();
+		command(sql.data, 0, NULL);
+		thr_copy_done_pages(b);
+		thr_pace(thr_now() - t0);
+	}
+	termStringInfo(&sql);
+	thr_maybe_report(true);
+}
+
 static void
 repack_one_table(repack_table *table, const char *orderby)
 {
@@ -1279,6 +1392,14 @@ repack_one_table(repack_table *table, const char *orderby)
 	elog(DEBUG2, "sql_delete        : %s", table->sql_delete);
 	elog(DEBUG2, "sql_update        : %s", table->sql_update);
 	elog(DEBUG2, "sql_pop           : %s", table->sql_pop);
+
+	if (thr_enabled && thr_copy_slice_pages > 0 && !dryrun &&
+		PQserverVersion(connection) < 140000)
+		ereport(ERROR, (errcode(EINVAL),
+			errmsg("the sliced copy needs TID range scans (PostgreSQL 14 or later);"
+				   " use --copy-slice-pages=0 on this server")));
+
+	thr_begin_table(table->target_oid, table->target_name, dryrun);
 
 	if (dryrun)
 		return;
@@ -1485,6 +1606,7 @@ repack_one_table(repack_table *table, const char *orderby)
 	 * 2. Copy tuples into temp table.
 	 */
 	elog(DEBUG2, "---- copy tuples ----");
+	thr_set_phase("copy");
 
 	/* Must use SERIALIZABLE (or at least not READ COMMITTED) to avoid race
 	 * condition between the create_table statement and rows subsequently
@@ -1536,7 +1658,10 @@ repack_one_table(repack_table *table, const char *orderby)
 	command(table->create_table, 2, params);
 	if (table->alter_col_storage)
 		command(table->alter_col_storage, 0, NULL);
-	command(table->copy_data, 0, NULL);
+	if (thr_enabled && thr_copy_slice_pages > 0)
+		copy_sliced(table);
+	else
+		command(table->copy_data, 0, NULL);
 	temp_obj_num++;
 	printfStringInfo(&sql, "SELECT repack.disable_autovacuum('repack.table_%u')", table->target_oid);
 	if (table->drop_columns)
@@ -1555,6 +1680,8 @@ repack_one_table(repack_table *table, const char *orderby)
 	/*
 	 * 3. Create indexes on temp table.
 	 */
+	thr_set_phase("index");
+	thr_maybe_report(true);
 	if (!rebuild_indexes(table))
 		goto cleanup;
 
@@ -1566,9 +1693,21 @@ repack_one_table(repack_table *table, const char *orderby)
 	 * 4. Apply log to temp table until no tuples are left in the log
 	 * and all of the old transactions are finished.
 	 */
+	thr_set_phase("apply");
 	for (;;)
 	{
+		double		t0;
+
+		/* Back off before each batch, pace after it (but not in the final,
+		 * locked apply_log() below, which must stay short). */
+		thr_wait_backoff();
+		t0 = thr_now();
 		num = apply_log(connection, table, apply_count);
+		thr_apply_done_rows(num);
+		if (num > switch_threshold)
+			thr_pace(thr_now() - t0);
+		else
+			thr_maybe_report(false);
 
 		/* We'll keep applying tuples from the log table in batches
 		 * of apply_count, until applying a batch of tuples
@@ -1600,7 +1739,7 @@ repack_one_table(repack_table *table, const char *orderby)
 			}
 
 			CLEARPGRES(res);
-			sleep(1);
+			thr_sleep(1);
 			continue;
 		}
 		else
@@ -1617,6 +1756,10 @@ repack_one_table(repack_table *table, const char *orderby)
 	 *    ShareUpdateExclusiveLock lock.
 	 */
 	elog(DEBUG2, "---- swap ----");
+	/* Don't let the runtime guard interrupt the (short) swap; signals still work. */
+	thr_disarm_runtime();
+	thr_set_phase("swap");
+	thr_maybe_report(true);
 	/* Bump our existing ShareUpdateExclusive lock to AccessExclusive */
 
 	if (!(lock_exclusive(conn2, utoa(table->target_oid, buffer),
@@ -1645,6 +1788,7 @@ repack_one_table(repack_table *table, const char *orderby)
 	params[0] = utoa(table->target_oid, buffer);
 	pgut_command(conn2, "SELECT repack.repack_swap($1)", 1, params);
 	pgut_command(conn2, "COMMIT", 0, NULL);
+	thr_set_phase("drop");
 
 	/*
 	 * 6. Drop.
@@ -1687,12 +1831,15 @@ repack_one_table(repack_table *table, const char *orderby)
 	res = pgut_execute(connection, "SELECT pg_advisory_unlock($1, CAST(-2147483648 + $2::bigint AS integer))",
 			   2, params);
 	ret = true;
+	thr_set_phase("done");
+	thr_maybe_report(true);
 
 cleanup:
 	CLEARPGRES(res);
 	termStringInfo(&sql);
 	if (vxid)
 		free(vxid);
+	thr_end_table();
 
 	/* Rollback current transactions */
 	pgut_rollback(connection);
@@ -1703,6 +1850,11 @@ cleanup:
 	 */
 	if ((!ret) && table_init)
 		repack_cleanup(false, table);
+
+	/* The guard was disarmed for the swap. Re-arm it only now that this
+	 * table is finished (or cleaned up), so an expired deadline stops the
+	 * next table instead of failing this one after its swap. */
+	thr_rearm_runtime();
 }
 
 /* Kill off any concurrent DDL (or any transaction attempting to take
@@ -2028,6 +2180,11 @@ repack_cleanup_callback(bool fatal, void *userdata)
 		params[0] = utoa(target_table, buffer);
 		params[1] = utoa(temp_obj_num, num_buff);
 
+		/* Say what is happening before the (possibly slow) lock wait. */
+		elog(INFO, "aborting: reason=%s phase=%s; rolling back and dropping"
+			 " temporary objects for %s", thr_abort_reason(), thr_get_phase(),
+			 table->target_name);
+
 		/* testing PQstatus() of connection and conn2, as we do
 		 * in repack_cleanup(), doesn't seem to work here,
 		 * so just use an unconditional reconnect().
@@ -2038,6 +2195,7 @@ repack_cleanup_callback(bool fatal, void *userdata)
 		if (!(lock_exclusive(connection, params[0], table->lock_table, false)))
 		{
 			pgut_rollback(connection);
+			thr_report_abort(table->target_name, false);
 			elog(ERROR, "lock_exclusive() failed in connection for %s during cleanup callback",
 				 table->target_name);
 		}
@@ -2045,6 +2203,7 @@ repack_cleanup_callback(bool fatal, void *userdata)
 		command("SELECT repack.repack_drop($1, $2)", 2, params);
 		command("COMMIT", 0, NULL);
 		temp_obj_num = 0; /* reset temporary object counter after cleanup */
+		thr_report_abort(table->target_name, true);
 	}
 }
 
@@ -2458,4 +2617,15 @@ pgut_help(bool details)
 	printf("      --error-on-invalid-index       don't repack when invalid index is found, deprecated, as this is the default behavior now\n");
 	printf("      --apply-count                  number of tuples to apply in one transaction during replay\n");
 	printf("      --switch-threshold             switch tables when that many tuples are left to catchup\n");
+	printf("\nThrottling (struct-throttle; copy options need --no-order; 0 disables a knob):\n");
+	printf("      --copy-slice-pages=N           heap pages copied per slice (default %d, 0 = one statement)\n", THR_DEFAULT_COPY_SLICE_PAGES);
+	printf("      --duty-cycle=X                 fraction of time spent working, 0<X<=1 (default %.2f, 1 = no pacing)\n", THR_DEFAULT_DUTY_CYCLE);
+	printf("      --max-slice-sleep=DUR          cap on the pause after one slice/batch (default %.0fs)\n", THR_DEFAULT_MAX_SLICE_SLEEP);
+	printf("      --backoff-io-waiters=N         pause while >= N other backends wait on IO (default %d)\n", THR_DEFAULT_BACKOFF_IO_WAITERS);
+	printf("      --backoff-wal-gb=G             pause while pg_wal holds >= G GB (default %.0f)\n", THR_DEFAULT_BACKOFF_WAL_GB);
+	printf("      --backoff-replica-lag=DUR      pause while a replica's replay_lag >= DUR (default %.0fs)\n", THR_DEFAULT_BACKOFF_REPLICA_LAG);
+	printf("      --backoff-step=DUR             re-check interval while backing off (default %.0fs)\n", THR_DEFAULT_BACKOFF_STEP);
+	printf("      --backoff-max=DUR              warn every step once one back-off lasts longer (default %.0fs)\n", THR_DEFAULT_BACKOFF_MAX);
+	printf("      --max-runtime=DUR              abort and clean up after DUR (default 4h, 0 = no limit)\n");
+	printf("      --progress-interval=DUR        progress line interval (default %.0fs, 0 = off)\n", THR_DEFAULT_PROGRESS_INTERVAL);
 }
