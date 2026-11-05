@@ -23,4 +23,7 @@ COPY --from=build /src/bin/pg_repack /usr/local/bin/pg_repack
 COPY repack.sh /usr/local/bin/repack.sh
 RUN chmod 0755 /usr/local/bin/repack.sh && pg_repack --version
 USER postgres
+# The postgres base image sets STOPSIGNAL SIGINT; be explicit that a stop is a
+# SIGTERM (what Container Apps sends). repack.sh forwards either one.
+STOPSIGNAL SIGTERM
 ENTRYPOINT ["/usr/local/bin/repack.sh"]
