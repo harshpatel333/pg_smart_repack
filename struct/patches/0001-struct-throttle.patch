@@ -12,7 +12,7 @@ index 8a56a9e..c05fbc6 100644
  PROGRAM = pg_repack
  
 diff --git a/bin/pg_repack.c b/bin/pg_repack.c
-index de67f0e..4ab2e48 100644
+index de67f0e..bb5bfc3 100644
 --- a/bin/pg_repack.c
 +++ b/bin/pg_repack.c
 @@ -22,7 +22,11 @@ const char *PROGRAM_VERSION = xstr(REPACK_VERSION);
@@ -449,7 +449,7 @@ index de67f0e..4ab2e48 100644
  		/* testing PQstatus() of connection and conn2, as we do
  		 * in repack_cleanup(), doesn't seem to work here,
  		 * so just use an unconditional reconnect().
-@@ -2035,17 +2297,120 @@ repack_cleanup_callback(bool fatal, void *userdata)
+@@ -2035,19 +2297,129 @@ repack_cleanup_callback(bool fatal, void *userdata)
  		reconnect(ERROR);
  
  		command("BEGIN ISOLATION LEVEL READ COMMITTED", 0, NULL);
@@ -472,9 +472,9 @@ index de67f0e..4ab2e48 100644
  		temp_obj_num = 0; /* reset temporary object counter after cleanup */
 +		cleanup_done = true;
 +		thr_report_abort(table->target_name, true);
-+	}
-+}
-+
+ 	}
+ }
+ 
 +/*
 + * Take the table lock for abort cleanup within the stop grace period (30s on
 + * Container Apps jobs; a SIGKILL there leaves the trigger logging every
@@ -493,6 +493,7 @@ index de67f0e..4ab2e48 100644
 +	const char *params[1];
 +	PGresult   *res;
 +	bool		ok = false;
++	int			logged_stage = 0;	/* 1 = cancel logged, 2 = terminate logged */
 +
 +	snprintf(pidbuf, sizeof(pidbuf), "%d", PQbackendPID(connection));
 +	params[0] = pidbuf;
@@ -537,9 +538,15 @@ index de67f0e..4ab2e48 100644
 +				"  JOIN pg_stat_activity a ON a.pid = b"
 +				" WHERE a.datname = current_database()",
 +				1, params, WARNING);
-+			if (PQresultStatus(res) == PGRES_TUPLES_OK && atoi(PQgetvalue(res, 0, 0)) > 0)
++			/* Log once per stage (cancel is re-sent every tick, and an idle
++			 * blocker "accepts" every cancel without effect). */
++			if (PQresultStatus(res) == PGRES_TUPLES_OK && atoi(PQgetvalue(res, 0, 0)) > 0 &&
++				logged_stage < (terminate ? 2 : 1))
++			{
 +				elog(WARNING, "abort cleanup: %s %s session(s) blocking the table lock",
-+					 terminate ? "terminated" : "cancelled", PQgetvalue(res, 0, 0));
++					 terminate ? "terminating" : "cancelling", PQgetvalue(res, 0, 0));
++				logged_stage = terminate ? 2 : 1;
++			}
 +			CLEARPGRES(res);
 +		}
 +
@@ -556,7 +563,7 @@ index de67f0e..4ab2e48 100644
 +		if (!ok)
 +			elog(WARNING, "abort cleanup: LOCK failed: %s", PQerrorMessage(connection));
 +		CLEARPGRES(res);
- 	}
++	}
 +	return ok;
 +}
 +
@@ -571,10 +578,12 @@ index de67f0e..4ab2e48 100644
 +
 +	if (fatal && cleanup_started && !cleanup_done)
 +		thr_report_abort(table->target_name, false);
- }
- 
++}
++
  /*
-@@ -2458,4 +2823,15 @@ pgut_help(bool details)
+  * The userdata pointing a table being re-organized. We need to cleanup temp
+  * objects before the program exits.
+@@ -2458,4 +2830,15 @@ pgut_help(bool details)
  	printf("      --error-on-invalid-index       don't repack when invalid index is found, deprecated, as this is the default behavior now\n");
  	printf("      --apply-count                  number of tuples to apply in one transaction during replay\n");
  	printf("      --switch-threshold             switch tables when that many tuples are left to catchup\n");

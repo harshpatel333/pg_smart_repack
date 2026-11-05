@@ -2333,6 +2333,7 @@ abort_lock_table(const repack_table *table)
 	const char *params[1];
 	PGresult   *res;
 	bool		ok = false;
+	int			logged_stage = 0;	/* 1 = cancel logged, 2 = terminate logged */
 
 	snprintf(pidbuf, sizeof(pidbuf), "%d", PQbackendPID(connection));
 	params[0] = pidbuf;
@@ -2377,9 +2378,15 @@ abort_lock_table(const repack_table *table)
 				"  JOIN pg_stat_activity a ON a.pid = b"
 				" WHERE a.datname = current_database()",
 				1, params, WARNING);
-			if (PQresultStatus(res) == PGRES_TUPLES_OK && atoi(PQgetvalue(res, 0, 0)) > 0)
+			/* Log once per stage (cancel is re-sent every tick, and an idle
+			 * blocker "accepts" every cancel without effect). */
+			if (PQresultStatus(res) == PGRES_TUPLES_OK && atoi(PQgetvalue(res, 0, 0)) > 0 &&
+				logged_stage < (terminate ? 2 : 1))
+			{
 				elog(WARNING, "abort cleanup: %s %s session(s) blocking the table lock",
-					 terminate ? "terminated" : "cancelled", PQgetvalue(res, 0, 0));
+					 terminate ? "terminating" : "cancelling", PQgetvalue(res, 0, 0));
+				logged_stage = terminate ? 2 : 1;
+			}
 			CLEARPGRES(res);
 		}
 
