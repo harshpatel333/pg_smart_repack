@@ -193,8 +193,14 @@ behaviour. `repack.sh` does not use `--jobs`.
   `storage_percent`, `txlogs_storage_used`, `disk_bandwidth_consumed_percentage`,
   `disk_queue_depth` and app error rates, every 1–2 minutes.
 - **Tune:** aim for disk bandwidth ≤ ~50% during the copy. Lower
-  `REPACK_DUTY_CYCLE` to go gentler; change `REPACK_COPY_SLICE_PAGES` only if
-  slices take much longer than a few seconds.
+  `REPACK_DUTY_CYCLE` to go gentler. Pacing lowers the **average** write
+  rate, not the peak: each slice still runs at full speed, and Azure's
+  1-minute bandwidth metric averages over the bursts. If short bursts
+  themselves hurt app latency, lower `REPACK_COPY_SLICE_PAGES` so each burst
+  is shorter. In a local test on a 7.4 GB TOAST-heavy table (same disk as a
+  streaming replica), going from duty 1.0 to 0.33 halved the copy's own
+  write rate and doubled its runtime (not 3×: slices run faster on a disk
+  that is not saturated). Peak MB/s stayed the same.
 - **To abort:** stop the job execution and wait for the "aborted cleanly"
   line. Fall back to `abort-repack.sql`, which a person runs.
 - **The cost of the single snapshot (D1):** while the copy runs, vacuum cannot

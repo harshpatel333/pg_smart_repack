@@ -11,7 +11,8 @@ OUT=${OUT:-/tmp/repack-tests}; mkdir -p "$OUT"
 DEV=${DEV:-nvme0n1}
 
 sampler() { # epoch wMB/s util% avg-queue  (from /proc/diskstats, 1s)
-  python3 -I -c '
+  # exec: so that killing the background job kills python itself
+  exec python3 -I -c '
 import sys, time
 dev = sys.argv[1]
 def read():
